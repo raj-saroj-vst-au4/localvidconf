@@ -37,6 +37,7 @@ interface UseMediasoupReturn {
   startScreenShare: () => Promise<void>;
   stopScreenShare: () => void;
   initializeMedia: (routerCapabilities: mediasoupTypes.RtpCapabilities) => Promise<void>;
+  consumeProducer: (producerId: string, peerId: string, participantId: string, userName: string, userImage: string | null, kind: string, appData: any) => Promise<void>;
 }
 
 export function useMediasoup({ socket, isConnected }: UseMediasoupProps): UseMediasoupReturn {

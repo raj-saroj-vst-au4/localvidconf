@@ -32,8 +32,10 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# openssl is required by Prisma's query engine on Alpine (OpenSSL 3.x)
+RUN apk add --no-cache openssl
+
 # Create non-root user for security
-# Running as root in Docker is a security risk
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 nextjs
 

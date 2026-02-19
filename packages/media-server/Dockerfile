@@ -31,8 +31,8 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
-# mediasoup worker needs these runtime libs
-RUN apk add --no-cache libstdc++
+# mediasoup worker needs these runtime libs; openssl for Prisma query engine
+RUN apk add --no-cache libstdc++ openssl
 
 # Create non-root user (security best practice)
 RUN addgroup --system --gid 1001 mediaserver && \
