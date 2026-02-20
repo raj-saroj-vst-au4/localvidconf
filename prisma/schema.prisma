@@ -1,0 +1,217 @@
+// =============================================================================
+// Prisma Schema - Meet Clone Database
+// MySQL database with all tables for meetings, participants, Q&A, breakouts
+// Shared between the Next.js web app and the media server
+// =============================================================================
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// --- User Model ---
+// Stores authenticated Google OAuth users
+// Every user must be authenticated before accessing any feature
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  password  String?  // bcrypt-hashed password
+  image     String?
+  createdAt DateTime @default(now())
+
+  // Relations: a user can host meetings, participate, ask questions, upvote, invite
+  hostedMeetings  Meeting[]     @relation("host")
+  participations  Participant[]
+  questions       Question[]
+  upvotes         Upvote[]
+  sentInvitations Invitation[]
+}
+
+// --- Meeting Model ---
+// Core entity representing a video conference session
+// Has a unique join code (e.g., "abc-defg-hij") for easy sharing
+model Meeting {
+  id          String        @id @default(cuid())
+  title       String
+  description String?       @db.Text
+  code        String        @unique // Cryptographically random join code (nanoid)
+  hostId      String
+  host        User          @relation("host", fields: [hostId], references: [id])
+  status      MeetingStatus @default(SCHEDULED)
+  scheduledAt DateTime?     // When the meeting is planned to start
+  startedAt   DateTime?     // When the meeting actually started
+  endedAt     DateTime?     // When the meeting ended
+  lobbyEnabled Boolean      @default(true) // Whether new joiners wait in lobby
+  createdAt   DateTime      @default(now())
+
+  // Relations
+  participants  Participant[]
+  breakoutRooms BreakoutRoom[]
+  questions     Question[]
+  invitations   Invitation[]
+  reminders     Reminder[]
+  chatMessages  ChatMessage[]
+
+  @@index([hostId])
+  @@index([status])
+  @@index([code])
+}
+
+// --- Participant Model ---
+// Junction table: tracks who is in which meeting and their current state
+// A user can only be a participant once per meeting (@@unique constraint)
+model Participant {
+  id             String            @id @default(cuid())
+  userId         String
+  user           User              @relation(fields: [userId], references: [id])
+  meetingId      String
+  meeting        Meeting           @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  role           ParticipantRole   @default(PARTICIPANT)
+  status         ParticipantStatus @default(IN_LOBBY) // Start in lobby by default
+  breakoutRoomId String?
+  breakoutRoom   BreakoutRoom?     @relation(fields: [breakoutRoomId], references: [id], onDelete: SetNull)
+  joinedAt       DateTime          @default(now())
+  leftAt         DateTime?
+
+  // One participation record per user per meeting
+  @@unique([userId, meetingId])
+  @@index([meetingId])
+  @@index([breakoutRoomId])
+}
+
+// --- BreakoutRoom Model ---
+// Sub-rooms within a meeting for small group discussions
+// Each breakout room gets its own mediasoup router for isolated media
+model BreakoutRoom {
+  id        String   @id @default(cuid())
+  name      String   // Display name (e.g., "Group A", "Team 1")
+  meetingId String
+  meeting   Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  isActive  Boolean  @default(true)
+  endsAt    DateTime? // Optional timer: auto-close when this time is reached
+  createdAt DateTime @default(now())
+
+  participants Participant[]
+
+  @@index([meetingId])
+}
+
+// --- Question Model ---
+// Q&A feature (Slido-style): participants ask questions during the meeting
+// Questions can be upvoted, pinned by host, and marked as answered
+model Question {
+  id         String   @id @default(cuid())
+  content    String   @db.Text
+  authorId   String
+  author     User     @relation(fields: [authorId], references: [id])
+  meetingId  String
+  meeting    Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  isAnswered Boolean  @default(false)
+  isPinned   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  upvotes Upvote[]
+
+  // Index for efficient query: get all questions for a meeting, ordered by time
+  @@index([meetingId, createdAt])
+}
+
+// --- Upvote Model ---
+// Tracks who upvoted which question
+// @@unique([questionId, userId]) prevents duplicate votes (improvement over slido reference)
+model Upvote {
+  id         String   @id @default(cuid())
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  createdAt  DateTime @default(now())
+
+  // Each user can only upvote a question once - prevents spam
+  @@unique([questionId, userId])
+}
+
+// --- Invitation Model ---
+// Tracks email invitations sent by the host to join a meeting
+model Invitation {
+  id          String           @id @default(cuid())
+  email       String           // Invitee's email address
+  meetingId   String
+  meeting     Meeting          @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  invitedById String
+  invitedBy   User             @relation(fields: [invitedById], references: [id])
+  status      InvitationStatus @default(PENDING)
+  sentAt      DateTime         @default(now())
+
+  @@index([meetingId])
+  @@index([email])
+}
+
+// --- Reminder Model ---
+// Scheduled reminders (email + in-app) for upcoming meetings
+// A cron job scans this table and triggers unsent reminders
+model Reminder {
+  id        String       @id @default(cuid())
+  meetingId String
+  meeting   Meeting      @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  type      ReminderType
+  triggerAt DateTime     // When this reminder should fire
+  sent      Boolean      @default(false)
+  createdAt DateTime     @default(now())
+
+  // Index for cron query: find unsent reminders due to fire
+  @@index([triggerAt, sent])
+  @@index([meetingId])
+}
+
+// --- ChatMessage Model ---
+// In-meeting chat messages, persisted for meeting history
+model ChatMessage {
+  id          String   @id @default(cuid())
+  content     String   @db.Text
+  senderEmail String
+  senderName  String
+  meetingId   String
+  meeting     Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@index([meetingId, createdAt])
+}
+
+// --- Enums ---
+
+enum MeetingStatus {
+  SCHEDULED // Meeting created but not started
+  LIVE      // Meeting is currently active
+  ENDED     // Meeting has concluded
+}
+
+enum ParticipantRole {
+  HOST        // Full control: mute, kick, breakout, transfer
+  CO_HOST     // Same as host except cannot transfer host role
+  PARTICIPANT // Regular participant with no admin privileges
+}
+
+enum ParticipantStatus {
+  IN_LOBBY   // Waiting for host to admit
+  IN_MEETING // Active in the main meeting room
+  IN_BREAKOUT // Currently in a breakout room
+  REMOVED    // Kicked by host
+}
+
+enum InvitationStatus {
+  PENDING  // Invitation sent, no response yet
+  ACCEPTED // Invitee has joined the meeting
+  DECLINED // Invitee declined (not yet implemented in UI)
+}
+
+enum ReminderType {
+  EMAIL  // Sent via Nodemailer SMTP
+  IN_APP // Delivered via Socket.IO toast notification
+}

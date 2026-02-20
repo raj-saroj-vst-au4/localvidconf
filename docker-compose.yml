@@ -1,0 +1,77 @@
+# =============================================================================
+# Confera - Docker Compose Orchestration
+# 3 services: Next.js Web (port 3000), Media Server (port 4000), Coturn
+# MySQL runs on the host (system service) - containers use host networking
+# Apache on the public server reverse-proxies /meet → :3000, /media → :4000
+# =============================================================================
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Next.js Web App - Frontend + API routes
+  # Uses host network to connect to MySQL on localhost
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: packages/web/Dockerfile
+    container_name: confera-web
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      NODE_ENV: ${NODE_ENV:-production}
+      HOSTNAME: "0.0.0.0"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/meet/api/auth/session"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Media Server - Socket.IO signaling + mediasoup SFU
+  # Uses host network for MySQL access + WebRTC UDP ports
+  # ---------------------------------------------------------------------------
+  media-server:
+    build:
+      context: .
+      dockerfile: packages/media-server/Dockerfile
+    container_name: confera-media-server
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      MEDIASOUP_LISTEN_IP: ${MEDIASOUP_LISTEN_IP:-0.0.0.0}
+      MEDIASOUP_ANNOUNCED_IP: ${MEDIASOUP_ANNOUNCED_IP:-127.0.0.1}
+      TURN_SERVER_URL: ${TURN_SERVER_URL}
+      TURN_SECRET: ${TURN_SECRET}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_FROM}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      NODE_ENV: ${NODE_ENV:-production}
+    cap_add:
+      - SYS_NICE
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Coturn - Self-hosted TURN/STUN server for NAT traversal
+  # ---------------------------------------------------------------------------
+  coturn:
+    image: coturn/coturn:latest
+    container_name: confera-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
+    command: ["-c", "/etc/turnserver.conf"]
+
