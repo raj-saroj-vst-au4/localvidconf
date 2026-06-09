@@ -34,6 +34,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Meeting not found' }, { status: 404 });
   }
 
+  // Authorization: only the host may schedule reminders (they trigger emails to
+  // all participants). Prevents any authenticated user from spamming via SMTP.
+  const userId = (session.user as any).id;
+  if (meeting.hostId !== userId) {
+    return NextResponse.json(
+      { error: 'Only the host can schedule reminders' },
+      { status: 403 }
+    );
+  }
+
   if (!meeting.scheduledAt) {
     return NextResponse.json(
       { error: 'Meeting has no scheduled time. Cannot set reminder.' },

@@ -27,6 +27,16 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'meetingId is required' }, { status: 400 });
   }
 
+  // Authorization: only participants of this meeting may read its Q&A (prevents
+  // IDOR enumeration of questions/authors across meetings).
+  const membership = await prisma.participant.findUnique({
+    where: { userId_meetingId: { userId, meetingId } },
+    select: { status: true },
+  });
+  if (!membership || membership.status === 'REMOVED') {
+    return NextResponse.json({ error: 'Not a participant' }, { status: 403 });
+  }
+
   // Fetch questions with upvote count and whether the current user has upvoted
   const questions = await prisma.question.findMany({
     where: { meetingId },

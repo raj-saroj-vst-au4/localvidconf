@@ -98,10 +98,11 @@ export function registerBreakoutHandlers(
         // Create mediasoup router for this breakout room
         await room.createBreakoutRouter(breakoutRoom.id, worker);
 
-        // Assign participants to this breakout room in the database
+        // Assign participants to this breakout room — scoped to this meeting so a
+        // host cannot move participants from OTHER meetings (cross-meeting IDOR).
         for (const participantId of roomConfig.participantIds) {
-          await prisma.participant.update({
-            where: { id: participantId },
+          await prisma.participant.updateMany({
+            where: { id: participantId, meetingId: socket.data.meetingId },
             data: {
               status: 'IN_BREAKOUT',
               breakoutRoomId: breakoutRoom.id,

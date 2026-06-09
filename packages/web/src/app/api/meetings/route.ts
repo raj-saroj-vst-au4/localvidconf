@@ -9,19 +9,17 @@ import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth';
 import prisma from '@/lib/prisma';
 import { createMeetingSchema } from '@/lib/validators';
-import { nanoid } from 'nanoid';
+import { customAlphabet } from 'nanoid';
 
 /**
- * Generate a meeting code in the format "abc-defg-hij"
- * Uses nanoid for cryptographic randomness (not Math.random)
- * This format is easy to read and share verbally
+ * Generate a meeting code in the format "abc-defg-hij".
+ * Uses nanoid's customAlphabet (crypto-strong RNG, unlike Math.random) over the
+ * [a-z] alphabet so codes always match the join validator
+ * regex /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/.
  */
+const nanoCode = customAlphabet('abcdefghijklmnopqrstuvwxyz', 10);
 function generateMeetingCode(): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyz';
-  // Generate 10 random characters and format as xxx-xxxx-xxx
-  const raw = Array.from({ length: 10 }, () =>
-    chars[Math.floor(Math.random() * chars.length)]
-  ).join('');
+  const raw = nanoCode();
   return `${raw.slice(0, 3)}-${raw.slice(3, 7)}-${raw.slice(7, 10)}`;
 }
 
@@ -71,28 +69,39 @@ export async function POST(req: NextRequest) {
   }
 
   const userId = (session.user as any).id;
-  const code = generateMeetingCode();
+  const input = parsed.data; // captured after the success guard so it's narrowed inside the closure
 
-  // Create the meeting and add the creator as a HOST participant in one transaction
-  // This ensures atomicity: if either fails, both are rolled back
-  const meeting = await prisma.meeting.create({
-    data: {
-      title: parsed.data.title,
-      description: parsed.data.description,
-      code,
-      hostId: userId,
-      scheduledAt: parsed.data.scheduledAt ? new Date(parsed.data.scheduledAt) : null,
-      lobbyEnabled: parsed.data.lobbyEnabled,
-      // Automatically add the creator as a HOST participant
-      participants: {
-        create: {
-          userId,
-          role: 'HOST',
-          status: 'IN_MEETING',
-        },
-      },
-    },
-  });
+  // Create the meeting + HOST participant, retrying on the (rare) unique-code
+  // collision (Prisma P2002) instead of surfacing a 500 to the user.
+  async function createWithUniqueCode() {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        return await prisma.meeting.create({
+          data: {
+            title: input.title,
+            description: input.description,
+            code: generateMeetingCode(),
+            hostId: userId,
+            scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
+            lobbyEnabled: input.lobbyEnabled,
+            // Automatically add the creator as a HOST participant
+            participants: {
+              create: {
+                userId,
+                role: 'HOST',
+                status: 'IN_MEETING',
+              },
+            },
+          },
+        });
+      } catch (err: any) {
+        if (err?.code === 'P2002' && attempt < 4) continue; // code collision → retry
+        throw err;
+      }
+    }
+    throw new Error('Could not generate a unique meeting code');
+  }
+  const meeting = await createWithUniqueCode();
 
   // If the meeting is scheduled, create reminders (15 min and 5 min before)
   if (parsed.data.scheduledAt) {

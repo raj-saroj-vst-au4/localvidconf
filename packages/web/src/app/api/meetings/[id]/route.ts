@@ -49,6 +49,28 @@ export async function GET(
     return NextResponse.json({ error: 'Meeting not found' }, { status: 404 });
   }
 
+  // Authorization: only members (host or a participant) get the full record,
+  // which includes participant emails. Non-members joining by code get a
+  // minimal view (enough to decide to join) without leaking the roster/PII.
+  const userId = (session.user as any).id;
+  const isHost = meeting.hostId === userId;
+  const isParticipant = meeting.participants.some((p) => p.userId === userId);
+  if (!isHost && !isParticipant) {
+    return NextResponse.json({
+      meeting: {
+        id: meeting.id,
+        title: meeting.title,
+        code: meeting.code,
+        status: meeting.status,
+        lobbyEnabled: meeting.lobbyEnabled,
+        scheduledAt: meeting.scheduledAt,
+        host: { name: meeting.host.name },
+        participants: [],
+        breakoutRooms: [],
+      },
+    });
+  }
+
   return NextResponse.json({ meeting });
 }
 

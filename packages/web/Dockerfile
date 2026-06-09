@@ -24,7 +24,8 @@ COPY packages/web/ ./
 COPY prisma ./prisma/
 
 # Generate Prisma client and build Next.js
-RUN npx prisma generate && npm run build
+# Ensure public/ exists (Next.js requires it for standalone output, even if empty)
+RUN mkdir -p public && npx prisma generate && npm run build
 
 # --- Stage 3: Production image ---
 FROM node:20-alpine AS runner

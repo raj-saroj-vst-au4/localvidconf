@@ -1,0 +1,44 @@
+# =============================================================================
+# Meet — ALL services on 10.127.1.70 (host networking).
+# web :3000, media-server :4000, coturn :3478 (+relay 49152-65535, RTC 40000-40100).
+# MySQL stays on 10.127.1.23:3306 (has the data) — reached over the LAN.
+# Images are built on 10.127.1.23 and shipped via docker save | ssh docker load.
+# Reverse proxy (www.som.iitb.ac.in) must point /meet + /media -> 10.127.1.70.
+# =============================================================================
+services:
+  web:
+    image: meet-web:latest
+    container_name: meet-web
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env.web70
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/meet/api/auth/session"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  media-server:
+    image: meet-media-server:latest
+    container_name: meet-media-server
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env.media70
+    cap_add:
+      - SYS_NICE
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:4000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: meet-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/turnserver.conf:ro
+    command: ["-c", "/etc/turnserver.conf"]

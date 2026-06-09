@@ -1,0 +1,32 @@
+# =============================================================================
+# Meet — BACKEND (media-server + coturn). Runs on 10.127.1.70.
+# Host networking for mediasoup WebRTC UDP (40000-40100) + TURN (3478).
+# DB (MySQL) and the web frontend live on 10.127.1.23.
+# The media-server image is built on 10.127.1.23 and shipped here via:
+#   docker save meet-media-server:latest | ssh r4id@10.127.1.70 docker load
+# turnserver.conf is copied next to this file on .70.
+# =============================================================================
+services:
+  media-server:
+    image: meet-media-server:latest
+    container_name: meet-media-server
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env.backend
+    cap_add:
+      - SYS_NICE
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:4000/health"]
+      start_period: 20s
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: meet-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/turnserver.conf:ro
+    command: ["-c", "/etc/turnserver.conf"]

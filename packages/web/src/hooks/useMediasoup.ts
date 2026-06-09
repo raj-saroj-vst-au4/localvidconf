@@ -55,6 +55,10 @@ export function useMediasoup({ socket, isConnected }: UseMediasoupProps): UseMed
   const recvTransportRef = useRef<mediasoupTypes.Transport | null>(null);
   const producersRef = useRef<Map<string, mediasoupTypes.Producer>>(new Map());
   const consumersRef = useRef<Map<string, mediasoupTypes.Consumer>>(new Map());
+  // ICE servers (STUN/TURN) fetched from the media server. Required for users
+  // behind restrictive/symmetric NAT (e.g. off-campus / mobile data) — without
+  // TURN they would silently fail to connect.
+  const iceServersRef = useRef<RTCIceServer[]>([]);
 
   // -------------------------------------------------------------------------
   // INITIALIZE MEDIA
@@ -72,6 +76,24 @@ export function useMediasoup({ socket, isConnected }: UseMediasoupProps): UseMed
       const device = new Device();
       await device.load({ routerRtpCapabilities: routerCapabilities });
       deviceRef.current = device;
+
+      // 1b. Fetch time-limited TURN/STUN credentials so both transports can
+      // traverse NAT. Same-origin path; the reverse proxy routes /media -> SFU.
+      try {
+        const res = await fetch('/media/turn-credentials');
+        if (res.ok) {
+          const t = await res.json();
+          const urls: string[] = Array.isArray(t.urls) ? t.urls : [];
+          const turnUrls = urls.filter((u) => u.startsWith('turn'));
+          const stunUrls = urls.filter((u) => u.startsWith('stun'));
+          const servers: RTCIceServer[] = [];
+          if (turnUrls.length) servers.push({ urls: turnUrls, username: t.username, credential: t.credential });
+          if (stunUrls.length) servers.push({ urls: stunUrls });
+          iceServersRef.current = servers;
+        }
+      } catch (e) {
+        console.warn('TURN credential fetch failed; continuing without relay (LAN-only)', e);
+      }
 
       // 2. Get user's camera and microphone
       // Start with both audio and video; user can toggle later
@@ -134,8 +156,8 @@ export function useMediasoup({ socket, isConnected }: UseMediasoupProps): UseMed
           iceParameters: data.iceParameters,
           iceCandidates: data.iceCandidates,
           dtlsParameters: data.dtlsParameters,
-          // ICE servers for NAT traversal
-          iceServers: [], // Will be populated from TURN credentials
+          // ICE servers (STUN/TURN) for NAT traversal
+          iceServers: iceServersRef.current,
         });
 
         // Handle transport 'connect' event (DTLS handshake)
@@ -182,6 +204,7 @@ export function useMediasoup({ socket, isConnected }: UseMediasoupProps): UseMed
           iceParameters: data.iceParameters,
           iceCandidates: data.iceCandidates,
           dtlsParameters: data.dtlsParameters,
+          iceServers: iceServersRef.current,
         });
 
         transport.on('connect', ({ dtlsParameters }, callback, errback) => {

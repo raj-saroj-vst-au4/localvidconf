@@ -38,6 +38,19 @@ export default function DashboardPage() {
     fetchMeetings();
   }, []);
 
+  // Surface why the user landed back on the dashboard (kicked / meeting ended),
+  // which the in-meeting page signals via ?kicked / ?ended, then clean the URL.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('kicked')) {
+      toast({ title: 'You were removed from the meeting by the host', status: 'warning', duration: 6000, isClosable: true });
+      window.history.replaceState(null, '', '/meet/');
+    } else if (params.get('ended')) {
+      toast({ title: 'The meeting has ended', status: 'info', duration: 6000, isClosable: true });
+      window.history.replaceState(null, '', '/meet/');
+    }
+  }, [toast]);
+
   async function fetchMeetings() {
     try {
       const res = await fetch('/meet/api/meetings');

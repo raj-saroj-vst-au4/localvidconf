@@ -190,14 +190,14 @@ export function registerQAHandlers(
         return;
       }
 
-      // Toggle the answered status
-      const question = await prisma.question.findUnique({
-        where: { id: data.questionId },
+      // Toggle the answered status (scoped to this meeting — prevent cross-meeting writes)
+      const question = await prisma.question.findFirst({
+        where: { id: data.questionId, meetingId: socket.data.meetingId },
       });
       if (!question) return;
 
       const updated = await prisma.question.update({
-        where: { id: data.questionId },
+        where: { id: question.id },
         data: { isAnswered: !question.isAnswered },
       });
 
@@ -217,6 +217,8 @@ export function registerQAHandlers(
   // Pinned questions always appear first, regardless of upvote count.
   // -------------------------------------------------------------------------
   socket.on('pin-question', async (data: { questionId: string }) => {
+    if (!checkRateLimit(socket, 'pin-question')) return;
+
     try {
       // Verify host role
       const hostParticipant = await prisma.participant.findFirst({
@@ -230,14 +232,14 @@ export function registerQAHandlers(
         return;
       }
 
-      // Toggle pin status
-      const question = await prisma.question.findUnique({
-        where: { id: data.questionId },
+      // Toggle pin status (scoped to this meeting — prevent cross-meeting writes)
+      const question = await prisma.question.findFirst({
+        where: { id: data.questionId, meetingId: socket.data.meetingId },
       });
       if (!question) return;
 
       const updated = await prisma.question.update({
-        where: { id: data.questionId },
+        where: { id: question.id },
         data: { isPinned: !question.isPinned },
       });
 

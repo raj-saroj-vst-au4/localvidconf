@@ -22,6 +22,7 @@ const log = createLogger('MeetingHandler');
 
 // Validation schemas for admin actions
 const emailSchema = z.string().email().max(320);
+const idSchema = z.string().cuid();
 
 /**
  * Helper: verify the socket user is HOST or CO_HOST of their current meeting.
@@ -80,6 +81,17 @@ export function registerMeetingHandlers(
       if (!hostParticipant) return;
 
       const meetingCode = socket.data.meetingCode;
+
+      // Authz: the target must belong to THIS host's meeting (prevent cross-meeting IDOR)
+      if (!idSchema.safeParse(data.participantId).success) return;
+      const inThisMeeting = await prisma.participant.findFirst({
+        where: { id: data.participantId, meetingId: socket.data.meetingId },
+        select: { id: true },
+      });
+      if (!inThisMeeting) {
+        socket.emit('error', { message: 'Participant is not in this meeting' });
+        return;
+      }
 
       // Update participant status in database
       const admitted = await prisma.participant.update({
@@ -140,11 +152,16 @@ export function registerMeetingHandlers(
 
       const meetingCode = socket.data.meetingCode;
 
-      // Update participant status to REMOVED
-      await prisma.participant.update({
-        where: { id: data.participantId },
+      // Authz: scope to this host's meeting (prevent cross-meeting IDOR)
+      if (!idSchema.safeParse(data.participantId).success) return;
+      const rejected = await prisma.participant.updateMany({
+        where: { id: data.participantId, meetingId: socket.data.meetingId },
         data: { status: 'REMOVED' },
       });
+      if (rejected.count === 0) {
+        socket.emit('error', { message: 'Participant is not in this meeting' });
+        return;
+      }
 
       // Find and notify the rejected participant
       const lobbyRoom = io.sockets.adapter.rooms.get(`lobby:${meetingCode}`);
@@ -178,13 +195,17 @@ export function registerMeetingHandlers(
       const meetingCode = socket.data.meetingCode;
       const room = rooms.get(meetingCode);
 
-      // Find the target participant's socket
-      const targetParticipant = await prisma.participant.findUnique({
-        where: { id: data.participantId },
+      // Find the target participant, scoped to this meeting (prevent cross-meeting IDOR)
+      if (!idSchema.safeParse(data.participantId).success) return;
+      const targetParticipant = await prisma.participant.findFirst({
+        where: { id: data.participantId, meetingId: socket.data.meetingId },
         include: { user: true },
       });
 
-      if (!targetParticipant) return;
+      if (!targetParticipant) {
+        socket.emit('error', { message: 'Participant is not in this meeting' });
+        return;
+      }
 
       // Prevent moving the host to lobby (host can't move themselves)
       if (targetParticipant.role === 'HOST') {
@@ -263,6 +284,16 @@ export function registerMeetingHandlers(
 
       const meetingCode = socket.data.meetingCode;
 
+      // Authz: the new host must be a participant of THIS meeting (prevent cross-meeting host hijack)
+      if (!idSchema.safeParse(data.newHostId).success) return;
+      const newHost = await prisma.participant.findFirst({
+        where: { id: data.newHostId, meetingId: socket.data.meetingId },
+      });
+      if (!newHost) {
+        socket.emit('error', { message: 'New host is not in this meeting' });
+        return;
+      }
+
       // Update roles in a transaction for atomicity
       await prisma.$transaction([
         // Demote current host to participant
@@ -272,17 +303,13 @@ export function registerMeetingHandlers(
         }),
         // Promote new host
         prisma.participant.update({
-          where: { id: data.newHostId },
+          where: { id: newHost.id },
           data: { role: 'HOST' },
         }),
         // Update the meeting's hostId
         prisma.meeting.update({
           where: { id: socket.data.meetingId },
-          data: {
-            hostId: (await prisma.participant.findUnique({
-              where: { id: data.newHostId },
-            }))?.userId || '',
-          },
+          data: { hostId: newHost.userId },
         }),
       ]);
 
@@ -317,11 +344,17 @@ export function registerMeetingHandlers(
       const meetingCode = socket.data.meetingCode;
       const room = rooms.get(meetingCode);
 
-      // Prevent kicking the host
-      const target = await prisma.participant.findUnique({
-        where: { id: data.participantId },
+      // Find target scoped to this meeting (prevent cross-meeting IDOR)
+      if (!idSchema.safeParse(data.participantId).success) return;
+      const target = await prisma.participant.findFirst({
+        where: { id: data.participantId, meetingId: socket.data.meetingId },
       });
-      if (target?.role === 'HOST') {
+      if (!target) {
+        socket.emit('error', { message: 'Participant is not in this meeting' });
+        return;
+      }
+      // Prevent kicking the host
+      if (target.role === 'HOST') {
         socket.emit('error', { message: 'Cannot kick the host' });
         return;
       }
