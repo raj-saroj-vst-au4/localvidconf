@@ -9,12 +9,17 @@
 
 import {
   Flex, IconButton, Button, Tooltip, Box, Text, Menu, MenuButton,
-  MenuList, MenuItem, Divider, useDisclosure,
+  MenuList, MenuItem, Divider, useDisclosure, Popover, PopoverTrigger,
+  PopoverContent, PopoverBody, SimpleGrid,
 } from '@chakra-ui/react';
 import {
   FiMic, FiMicOff, FiVideo, FiVideoOff, FiMonitor, FiPhoneOff,
   FiUsers, FiMessageSquare, FiHelpCircle, FiMoreVertical, FiGrid,
+  FiSmile, FiVolumeX, FiSettings,
 } from 'react-icons/fi';
+
+// Emoji set offered in the reactions popover (matches server's allow-list).
+const REACTION_EMOJIS = ['👍', '👏', '❤️', '😂', '😮', '🎉', '🙌', '✋'];
 
 interface ControlBarProps {
   isAudioEnabled: boolean;
@@ -38,6 +43,12 @@ interface ControlBarProps {
   isParticipantsOpen: boolean;
   isChatOpen: boolean;
   isQAOpen: boolean;
+  // Reactions, hand, host mute-all, settings (all optional; wired by page agent)
+  onReaction?: (emoji: string) => void;
+  onToggleHand?: () => void;
+  isHandRaised?: boolean;
+  onMuteAll?: () => void;
+  onOpenSettings?: () => void;
 }
 
 export default function ControlBar({
@@ -59,6 +70,11 @@ export default function ControlBar({
   isParticipantsOpen,
   isChatOpen,
   isQAOpen,
+  onReaction,
+  onToggleHand,
+  isHandRaised = false,
+  onMuteAll,
+  onOpenSettings,
 }: ControlBarProps) {
   return (
     <Flex
@@ -120,6 +136,59 @@ export default function ControlBar({
               borderRadius="full"
             />
           </Tooltip>
+
+          {/* Reactions popover */}
+          {onReaction && (
+            <Popover placement="top" isLazy>
+              <Tooltip label="Reactions">
+                <Box display="inline-block">
+                  <PopoverTrigger>
+                    <IconButton
+                      aria-label="Reactions"
+                      icon={<FiSmile />}
+                      variant="control"
+                      size={{ base: 'md', md: 'lg' }}
+                      borderRadius="full"
+                    />
+                  </PopoverTrigger>
+                </Box>
+              </Tooltip>
+              <PopoverContent
+                w="auto"
+                bg="meeting.surface"
+                borderColor="whiteAlpha.300"
+              >
+                <PopoverBody>
+                  <SimpleGrid columns={4} spacing={1}>
+                    {REACTION_EMOJIS.map((emoji) => (
+                      <IconButton
+                        key={emoji}
+                        aria-label={`React ${emoji}`}
+                        icon={<Text fontSize="xl">{emoji}</Text>}
+                        variant="ghost"
+                        size="md"
+                        onClick={() => onReaction(emoji)}
+                      />
+                    ))}
+                  </SimpleGrid>
+                </PopoverBody>
+              </PopoverContent>
+            </Popover>
+          )}
+
+          {/* Raise / lower hand */}
+          {onToggleHand && (
+            <Tooltip label={isHandRaised ? 'Lower hand' : 'Raise hand'}>
+              <IconButton
+                aria-label={isHandRaised ? 'Lower hand' : 'Raise hand'}
+                icon={<Text fontSize="lg">✋</Text>}
+                variant={isHandRaised ? 'controlActive' : 'control'}
+                size={{ base: 'md', md: 'lg' }}
+                onClick={onToggleHand}
+                borderRadius="full"
+              />
+            </Tooltip>
+          )}
         </Flex>
 
         {/* --- Center: Feature Panels --- */}
@@ -192,6 +261,34 @@ export default function ControlBar({
               />
             </Tooltip>
           )}
+
+          {/* Mute all (host only) */}
+          {isHost && onMuteAll && (
+            <Tooltip label="Mute everyone">
+              <IconButton
+                aria-label="Mute all"
+                icon={<FiVolumeX />}
+                variant="control"
+                size={{ base: 'md', md: 'lg' }}
+                onClick={onMuteAll}
+                borderRadius="full"
+              />
+            </Tooltip>
+          )}
+
+          {/* Settings / devices */}
+          {onOpenSettings && (
+            <Tooltip label="Settings">
+              <IconButton
+                aria-label="Settings"
+                icon={<FiSettings />}
+                variant="control"
+                size={{ base: 'md', md: 'lg' }}
+                onClick={onOpenSettings}
+                borderRadius="full"
+              />
+            </Tooltip>
+          )}
         </Flex>
 
         {/* --- Mobile overflow menu (replaces center buttons on mobile) --- */}
@@ -217,6 +314,21 @@ export default function ControlBar({
               {isHost && (
                 <MenuItem icon={<FiGrid />} onClick={onToggleBreakout} bg="transparent" _hover={{ bg: 'whiteAlpha.200' }}>
                   Breakout Rooms
+                </MenuItem>
+              )}
+              {isHost && onMuteAll && (
+                <MenuItem icon={<FiVolumeX />} onClick={onMuteAll} bg="transparent" _hover={{ bg: 'whiteAlpha.200' }}>
+                  Mute Everyone
+                </MenuItem>
+              )}
+              {onToggleHand && (
+                <MenuItem icon={<Text as="span">✋</Text>} onClick={onToggleHand} bg="transparent" _hover={{ bg: 'whiteAlpha.200' }}>
+                  {isHandRaised ? 'Lower Hand' : 'Raise Hand'}
+                </MenuItem>
+              )}
+              {onOpenSettings && (
+                <MenuItem icon={<FiSettings />} onClick={onOpenSettings} bg="transparent" _hover={{ bg: 'whiteAlpha.200' }}>
+                  Settings
                 </MenuItem>
               )}
             </MenuList>

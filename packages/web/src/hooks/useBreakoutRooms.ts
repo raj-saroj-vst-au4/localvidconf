@@ -6,7 +6,7 @@
 
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Socket } from 'socket.io-client';
 import type { BreakoutRoom, Participant } from '@/types';
 
@@ -37,6 +37,18 @@ export function useBreakoutRooms({
   const [currentBreakoutRoom, setCurrentBreakoutRoom] = useState<BreakoutRoom | null>(null);
   const [timeRemaining, setTimeRemaining] = useState<number | null>(null);
 
+  // Holds the active countdown interval id. Stored in a ref so we can clear it
+  // from the effect cleanup and from the 'breakout-ended' handler (a cleanup
+  // returned from a socket.on callback never runs).
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const clearCountdown = useCallback(() => {
+    if (countdownRef.current !== null) {
+      clearInterval(countdownRef.current);
+      countdownRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     if (!socket || !isConnected) return;
 
@@ -50,21 +62,23 @@ export function useBreakoutRooms({
       setIsInBreakout(true);
       setCurrentBreakoutRoom(data.breakoutRoom);
 
-      // Start countdown timer if there's an end time
+      // Start countdown timer if there's an end time. Clear any prior interval
+      // first, and store the id in a ref so the effect cleanup / 'breakout-ended'
+      // can stop it (the value returned from a socket.on callback is discarded).
       if (data.breakoutRoom.endsAt) {
+        clearCountdown();
         const endTime = new Date(data.breakoutRoom.endsAt).getTime();
-        const interval = setInterval(() => {
+        countdownRef.current = setInterval(() => {
           const remaining = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
           setTimeRemaining(remaining);
-          if (remaining <= 0) clearInterval(interval);
+          if (remaining <= 0) clearCountdown();
         }, 1000);
-
-        return () => clearInterval(interval);
       }
     });
 
     // Breakout rooms were closed - return to main room
     socket.on('breakout-ended', () => {
+      clearCountdown();
       setIsInBreakout(false);
       setCurrentBreakoutRoom(null);
       setBreakoutRooms([]);
@@ -86,8 +100,10 @@ export function useBreakoutRooms({
       socket.off('breakout-ended');
       socket.off('breakout-closed');
       socket.off('breakout-broadcast');
+      // Stop the countdown so the interval doesn't leak across reconnects/unmount.
+      clearCountdown();
     };
-  }, [socket, isConnected]);
+  }, [socket, isConnected, clearCountdown]);
 
   // --- Host Actions ---
 

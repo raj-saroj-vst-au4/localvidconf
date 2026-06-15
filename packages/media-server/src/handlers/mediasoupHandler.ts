@@ -340,6 +340,15 @@ export function registerMediasoupHandlers(
         temporalLayer: data.temporalLayer,
       });
 
+      // Observability for the adaptive-quality path: client down/upshifts a
+      // consumer's simulcast layer as its measured network quality changes.
+      log.info('Adapted consumer layers', {
+        socketId: socket.id,
+        consumerId: data.consumerId,
+        spatialLayer: data.spatialLayer,
+        temporalLayer: data.temporalLayer,
+      });
+
       if (callback) callback({ success: true });
     } catch (err: any) {
       log.error('Error setting layers', { error: err.message });

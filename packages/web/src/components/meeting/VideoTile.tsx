@@ -8,9 +8,12 @@
 'use client';
 
 import { useRef, useEffect } from 'react';
-import { Box, Avatar, Text, Flex, Icon, Badge } from '@chakra-ui/react';
+import { Box, Avatar, Text, Flex, Icon, Badge, Tooltip } from '@chakra-ui/react';
 import { FiMicOff, FiMonitor } from 'react-icons/fi';
 import { types as mediasoupTypes } from 'mediasoup-client';
+
+// Connection quality levels surfaced by the consumer stats / signaling layer.
+export type ConnectionQuality = 'good' | 'fair' | 'poor';
 
 interface VideoTileProps {
   stream?: MediaStream | null;             // MediaStream from getUserMedia or consumer
@@ -21,7 +24,8 @@ interface VideoTileProps {
   isVideoEnabled?: boolean;
   isScreenShare?: boolean;
   isLocal?: boolean;                        // True for the local user's tile
-  isSpeaking?: boolean;                     // Green border when speaking (future)
+  isSpeaking?: boolean;                     // Glowing border when actively speaking
+  connectionQuality?: ConnectionQuality;    // Network quality dot (optional)
 }
 
 export default function VideoTile({
@@ -34,6 +38,7 @@ export default function VideoTile({
   isScreenShare = false,
   isLocal = false,
   isSpeaking = false,
+  connectionQuality,
 }: VideoTileProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -55,7 +60,20 @@ export default function VideoTile({
         videoRef.current.srcObject = null;
       }
     };
-  }, [stream, consumer]);
+    // isVideoEnabled is a dependency because the <video> element is conditionally
+    // rendered on it: when a peer toggles video off then on, the element unmounts
+    // and a fresh one mounts. Without re-running here, the new element never gets
+    // its srcObject re-attached (consumer/stream are unchanged), so the tile stays
+    // black even though media is flowing again.
+  }, [stream, consumer, isVideoEnabled]);
+
+  // Connection-quality dot colour mapping (omitted entirely when undefined).
+  const qualityColor =
+    connectionQuality === 'poor'
+      ? 'red.400'
+      : connectionQuality === 'fair'
+        ? 'yellow.400'
+        : 'green.400';
 
   return (
     <Box
@@ -64,9 +82,10 @@ export default function VideoTile({
       borderRadius="lg"
       overflow="hidden"
       border="2px"
-      // Green border when speaking, subtle border otherwise
+      // Glowing green border when speaking, subtle border otherwise
       borderColor={isSpeaking ? 'green.400' : 'whiteAlpha.200'}
-      transition="border-color 0.2s"
+      boxShadow={isSpeaking ? '0 0 0 3px var(--chakra-colors-green-400)' : 'none'}
+      transition="border-color 0.2s, box-shadow 0.2s"
       w="100%"
       h="100%"
       minH={{ base: '120px', sm: '150px', md: '200px' }}
@@ -125,6 +144,18 @@ export default function VideoTile({
         </Text>
 
         <Flex align="center" gap={1}>
+          {/* Connection quality dot */}
+          {connectionQuality && (
+            <Tooltip label={`Connection: ${connectionQuality}`}>
+              <Box
+                boxSize={2}
+                borderRadius="full"
+                bg={qualityColor}
+                aria-label={`Connection quality: ${connectionQuality}`}
+              />
+            </Tooltip>
+          )}
+
           {/* Screen share badge */}
           {isScreenShare && (
             <Badge colorScheme="blue" fontSize="xs">

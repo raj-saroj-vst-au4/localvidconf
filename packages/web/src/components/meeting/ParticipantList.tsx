@@ -12,7 +12,10 @@ import {
   Heading, Tooltip, Input, Button, useDisclosure, Modal, ModalOverlay,
   ModalContent, ModalHeader, ModalBody, ModalFooter, ModalCloseButton,
 } from '@chakra-ui/react';
-import { FiUserMinus, FiCornerDownLeft, FiStar, FiUserPlus, FiCheck, FiX } from 'react-icons/fi';
+import {
+  FiUserMinus, FiCornerDownLeft, FiStar, FiUserPlus, FiCheck, FiX,
+  FiShield, FiMicOff,
+} from 'react-icons/fi';
 import { useState } from 'react';
 import type { Participant } from '@/types';
 
@@ -27,6 +30,13 @@ interface ParticipantListProps {
   onMoveToLobby: (participantId: string) => void;
   onTransferHost: (participantId: string) => void;
   onInvite: (email: string) => void;
+  // Optional host-only actions + raised-hand state (wired by the page agent).
+  onAdmitAll?: () => void;
+  onPromoteCoHost?: (participantId: string) => void;
+  onDemoteCoHost?: (participantId: string) => void;
+  onMuteParticipant?: (participantId: string) => void;
+  // Set of participantIds (DB ids) currently raising their hand.
+  raisedHands?: Set<string>;
 }
 
 export default function ParticipantList({
@@ -40,6 +50,11 @@ export default function ParticipantList({
   onMoveToLobby,
   onTransferHost,
   onInvite,
+  onAdmitAll,
+  onPromoteCoHost,
+  onDemoteCoHost,
+  onMuteParticipant,
+  raisedHands,
 }: ParticipantListProps) {
   const { isOpen, onOpen, onClose } = useDisclosure();
   const [inviteEmail, setInviteEmail] = useState('');
@@ -90,9 +105,22 @@ export default function ParticipantList({
       {/* --- Lobby Participants (host sees these) --- */}
       {isHost && lobbyParticipants.length > 0 && (
         <>
-          <Text fontSize="xs" color="yellow.400" fontWeight="bold" mb={2}>
-            WAITING IN LOBBY ({lobbyParticipants.length})
-          </Text>
+          <HStack justify="space-between" mb={2}>
+            <Text fontSize="xs" color="yellow.400" fontWeight="bold">
+              WAITING IN LOBBY ({lobbyParticipants.length})
+            </Text>
+            {onAdmitAll && (
+              <Button
+                size="xs"
+                colorScheme="green"
+                variant="ghost"
+                leftIcon={<FiCheck />}
+                onClick={onAdmitAll}
+              >
+                Admit all
+              </Button>
+            )}
+          </HStack>
           <VStack spacing={2} mb={4} align="stretch">
             {lobbyParticipants.map((p) => (
               <HStack
@@ -162,9 +190,52 @@ export default function ParticipantList({
                 )}
               </VStack>
 
+              {/* Raised-hand indicator */}
+              {raisedHands?.has(participant.id) && (
+                <Tooltip label="Hand raised">
+                  <Text fontSize="md" aria-label="Hand raised">✋</Text>
+                </Tooltip>
+              )}
+
               {/* Host controls for each participant */}
               {isHost && participant.userId !== currentUserId && (
                 <HStack spacing={0}>
+                  {/* Mute participant */}
+                  {onMuteParticipant && (
+                    <Tooltip label="Mute">
+                      <IconButton
+                        aria-label="Mute participant"
+                        icon={<FiMicOff />}
+                        size="xs"
+                        variant="ghost"
+                        onClick={() => onMuteParticipant(participant.id)}
+                      />
+                    </Tooltip>
+                  )}
+                  {/* Promote / demote co-host (toggles based on current role) */}
+                  {onPromoteCoHost && participant.role === 'PARTICIPANT' && (
+                    <Tooltip label="Make co-host">
+                      <IconButton
+                        aria-label="Promote to co-host"
+                        icon={<FiShield />}
+                        size="xs"
+                        variant="ghost"
+                        onClick={() => onPromoteCoHost(participant.id)}
+                      />
+                    </Tooltip>
+                  )}
+                  {onDemoteCoHost && participant.role === 'CO_HOST' && (
+                    <Tooltip label="Remove co-host">
+                      <IconButton
+                        aria-label="Demote co-host"
+                        icon={<FiShield />}
+                        size="xs"
+                        variant="ghost"
+                        color="purple.300"
+                        onClick={() => onDemoteCoHost(participant.id)}
+                      />
+                    </Tooltip>
+                  )}
                   <Tooltip label="Move to lobby">
                     <IconButton
                       aria-label="Move to lobby"

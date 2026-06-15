@@ -101,6 +101,12 @@ process.on('uncaughtException', (err) => {
 
 const app = express();
 
+// Behind the reverse proxy (HAProxy/nginx/Apache) every request carries an
+// X-Forwarded-For header. Trust the single proxy hop so req.ip is the real
+// client address — otherwise express-rate-limit throws ERR_ERL_UNEXPECTED_
+// X_FORWARDED_FOR and would rate-limit every user under the proxy's IP.
+app.set('trust proxy', 1);
+
 // Helmet: sets secure HTTP headers (CSP, HSTS, X-Frame-Options, etc.)
 app.use(helmet());
 
