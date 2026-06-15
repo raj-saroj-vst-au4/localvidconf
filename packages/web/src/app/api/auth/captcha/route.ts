@@ -1,6 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { NextResponse } from 'next/server';
+import { randomUUID } from 'crypto';
 import jwt from 'jsonwebtoken';
 
 export async function GET() {
@@ -12,10 +13,11 @@ export async function GET() {
   const [x, y] = op === '-' && b > a ? [b, a] : [a, b];
   const answer = op === '+' ? x + y : x - y;
 
+  // Random jti lets the verifier mark each captcha token single-use (anti-replay).
   const captchaToken = jwt.sign(
-    { answer, type: 'captcha' },
+    { answer, type: 'captcha', jti: randomUUID() },
     process.env.NEXTAUTH_SECRET!,
-    { expiresIn: '5m' }
+    { expiresIn: '5m', algorithm: 'HS256' }
   );
 
   return NextResponse.json({ question: `${x} ${op} ${y}`, captchaToken });

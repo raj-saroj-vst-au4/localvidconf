@@ -45,7 +45,7 @@ export function socketAuthMiddleware(socket: Socket, next: (err?: Error) => void
       throw new Error('NEXTAUTH_SECRET not configured');
     }
 
-    const decoded = jwt.verify(token, secret) as any;
+    const decoded = jwt.verify(token, secret, { algorithms: ['HS256'] }) as any;
 
     // Attach user data to socket for use in event handlers
     // This avoids re-querying the database for every socket event

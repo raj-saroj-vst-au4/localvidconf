@@ -22,6 +22,19 @@ import { z } from 'zod';
 
 const log = createLogger('BreakoutHandler');
 
+// Pending auto-close timers, keyed by meetingCode. Stored at module scope so the
+// create handler can register a timer and the close handler (manual or repeat
+// create) can clear it, preventing a leaked/double-firing setTimeout.
+const breakoutCloseTimers = new Map<string, NodeJS.Timeout>();
+
+function clearBreakoutCloseTimer(meetingCode: string): void {
+  const existing = breakoutCloseTimers.get(meetingCode);
+  if (existing) {
+    clearTimeout(existing);
+    breakoutCloseTimers.delete(meetingCode);
+  }
+}
+
 // Inline validation schema (avoid cross-package imports for Docker build isolation)
 const createBreakoutSchema = z.object({
   rooms: z.array(z.object({
@@ -52,7 +65,10 @@ export function registerBreakoutHandlers(
     },
     callback?: Function
   ) => {
-    if (!checkRateLimit(socket, 'lobby-admit')) return; // Reuse admin rate limit
+    if (!checkRateLimit(socket, 'lobby-admit')) { // Reuse admin rate limit
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
 
     try {
       // Verify host role
@@ -76,7 +92,10 @@ export function registerBreakoutHandlers(
 
       const meetingCode = socket.data.meetingCode;
       const room = rooms.get(meetingCode);
-      if (!room) return;
+      if (!room) {
+        if (typeof callback === 'function') callback({ error: 'Not in a meeting' });
+        return;
+      }
 
       const worker = getWorker();
       const endsAt = data.duration
@@ -129,14 +148,21 @@ export function registerBreakoutHandlers(
 
               const targetSocket = io.sockets.sockets.get(socketId);
               if (targetSocket) {
+                // Mark the peer as being in this breakout so the mediasoup
+                // handler routes its transports/consumers to the breakout router.
+                targetSocket.data.breakoutRoomId = createdRoom.id;
+
                 // Leave main meeting room, join breakout socket room
                 targetSocket.leave(`meeting:${meetingCode}`);
                 targetSocket.join(`breakout:${createdRoom.id}`);
 
-                // Tell the peer which breakout room they're in
-                // They'll need to re-create transports on the breakout router
+                // Tell the peer which breakout room they're in. They'll re-init
+                // their media (new device + transports) on the breakout router.
+                // breakoutRoom carries endsAt for the client countdown;
+                // breakoutRoomId is what the client echoes back on media events.
                 targetSocket.emit('breakout-joined', {
                   breakoutRoom: createdRoom,
+                  breakoutRoomId: createdRoom.id,
                   routerCapabilities: room.getBreakoutRouter(createdRoom.id)?.rtpCapabilities,
                 });
               }
@@ -151,12 +177,24 @@ export function registerBreakoutHandlers(
         rooms: createdRooms,
       });
 
-      // Set up auto-close timer if duration was specified
+      // Set up auto-close timer if duration was specified. Clear any prior
+      // timer first so re-creating breakouts can't leak / double-fire one.
+      clearBreakoutCloseTimer(meetingCode);
       if (data.duration) {
-        setTimeout(async () => {
-          // Auto-close breakout rooms when timer expires
-          await closeBreakoutRooms(io, socket, room, meetingCode, prisma);
+        const timer = setTimeout(() => {
+          // Drop our own handle first: the timer has fired, so there's nothing
+          // left to clear and closeBreakoutRooms() must not try to clear a stale
+          // entry that may have been re-registered by a newer create.
+          if (breakoutCloseTimers.get(meetingCode) === timer) {
+            breakoutCloseTimers.delete(meetingCode);
+          }
+          // Auto-close breakout rooms when timer expires. Re-resolve the room
+          // from the live map and guard against an already-closed meeting.
+          closeBreakoutRooms(io, socket, rooms, meetingCode, prisma).catch((err) => {
+            log.error('Error auto-closing breakout rooms', { meetingCode, error: err?.message });
+          });
         }, data.duration * 60 * 1000);
+        breakoutCloseTimers.set(meetingCode, timer);
 
         log.info('Breakout timer set', {
           meetingCode,
@@ -175,6 +213,7 @@ export function registerBreakoutHandlers(
     } catch (err: any) {
       log.error('Error creating breakout rooms', { error: err.message });
       socket.emit('error', { message: 'Failed to create breakout rooms' });
+      if (typeof callback === 'function') callback({ error: 'Failed to create breakout rooms' });
     }
   });
 
@@ -227,17 +266,22 @@ export function registerBreakoutHandlers(
           role: { in: ['HOST', 'CO_HOST'] },
         },
       });
-      if (!hostParticipant) return;
+      if (!hostParticipant) {
+        if (typeof callback === 'function') callback({ error: 'Only host can close breakout rooms' });
+        return;
+      }
 
       const meetingCode = socket.data.meetingCode;
-      const room = rooms.get(meetingCode);
-      if (!room) return;
 
-      await closeBreakoutRooms(io, socket, room, meetingCode, prisma);
+      // Manual close: cancel any pending auto-close timer first. The helper is
+      // idempotent and re-resolves the room, so a no-op here is safe.
+      clearBreakoutCloseTimer(meetingCode);
+      await closeBreakoutRooms(io, socket, rooms, meetingCode, prisma);
 
-      if (callback) callback({ success: true });
+      if (typeof callback === 'function') callback({ success: true });
     } catch (err: any) {
       log.error('Error closing breakouts', { error: err.message });
+      if (typeof callback === 'function') callback({ error: 'Failed to close breakout rooms' });
     }
   });
 }
@@ -245,14 +289,37 @@ export function registerBreakoutHandlers(
 /**
  * Helper: close all breakout rooms and return everyone to the main room.
  * Used by both the manual close event and the auto-close timer.
+ *
+ * Idempotent: safe to call when there are no active breakouts (e.g. the manual
+ * close already ran, or the meeting ended) — it no-ops in that case. Re-resolves
+ * the room from the live map so a stale timer firing after the room was torn
+ * down does not operate on a removed Room.
  */
 async function closeBreakoutRooms(
   io: SocketServer,
   socket: Socket,
-  room: Room,
+  rooms: Map<string, Room>,
   meetingCode: string,
   prisma: PrismaClient
 ): Promise<void> {
+  // Always cancel any pending auto-close timer for this meeting.
+  clearBreakoutCloseTimer(meetingCode);
+
+  const room = rooms.get(meetingCode);
+  if (!room) {
+    // Meeting already torn down — nothing left to close in mediasoup.
+    log.info('Skip closing breakouts: room no longer exists', { meetingCode });
+    return;
+  }
+
+  // Capture breakout room IDs before tearing the routers down. If there are
+  // none, the breakouts are already closed; bail out to avoid double-firing.
+  const breakoutRoomIds = room.getBreakoutRoomIds();
+  if (breakoutRoomIds.length === 0) {
+    log.info('Skip closing breakouts: already closed', { meetingCode });
+    return;
+  }
+
   // Close all breakout rooms in the database
   await prisma.breakoutRoom.updateMany({
     where: { meetingId: socket.data.meetingId, isActive: true },
@@ -271,11 +338,6 @@ async function closeBreakoutRooms(
     },
   });
 
-  // Get all breakout room IDs before closing
-  const breakoutRoomIds = Array.from(
-    (room as any).breakoutRouters?.keys?.() || []
-  );
-
   // Move all peers back to main room in mediasoup
   const movedSocketIds = room.closeAllBreakouts();
 
@@ -283,6 +345,10 @@ async function closeBreakoutRooms(
   for (const socketId of movedSocketIds) {
     const peerSocket = io.sockets.sockets.get(socketId);
     if (peerSocket) {
+      // Clear the breakout marker so the mediasoup handler routes this peer's
+      // media back to the main router.
+      peerSocket.data.breakoutRoomId = undefined;
+
       // Leave all breakout socket rooms
       for (const brId of breakoutRoomIds) {
         peerSocket.leave(`breakout:${brId}`);

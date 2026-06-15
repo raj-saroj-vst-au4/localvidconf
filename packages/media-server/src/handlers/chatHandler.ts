@@ -30,17 +30,24 @@ export function registerChatHandlers(
   // Messages are persisted in the database for meeting history.
   // -------------------------------------------------------------------------
   socket.on('send-chat', async (data: { content: string }, callback?: Function) => {
-    if (!checkRateLimit(socket, 'send-chat')) return;
+    if (!checkRateLimit(socket, 'send-chat')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
 
     try {
       const parsed = messageSchema.safeParse(data.content);
       if (!parsed.success) {
         socket.emit('error', { message: 'Invalid message' });
+        if (callback) callback({ error: 'Invalid message' });
         return;
       }
 
       const meetingId = socket.data.meetingId;
-      if (!meetingId) return;
+      if (!meetingId) {
+        if (callback) callback({ error: 'Not in a meeting' });
+        return;
+      }
 
       // Persist the chat message in the database
       const chatMessage = await prisma.chatMessage.create({
@@ -78,6 +85,7 @@ export function registerChatHandlers(
     } catch (err: any) {
       log.error('Error sending chat', { error: err.message });
       socket.emit('error', { message: 'Failed to send message' });
+      if (callback) callback({ error: 'Failed to send message' });
     }
   });
 

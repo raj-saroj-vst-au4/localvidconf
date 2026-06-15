@@ -37,12 +37,16 @@ export function registerQAHandlers(
   // in real-time, sorted by upvote count.
   // -------------------------------------------------------------------------
   socket.on('ask-question', async (data: { content: string }, callback?: Function) => {
-    if (!checkRateLimit(socket, 'ask-question')) return;
+    if (!checkRateLimit(socket, 'ask-question')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
 
     try {
       const parsed = questionSchema.safeParse(data.content);
       if (!parsed.success) {
         socket.emit('error', { message: 'Invalid question' });
+        if (callback) callback({ error: 'Invalid question' });
         return;
       }
 
@@ -97,6 +101,7 @@ export function registerQAHandlers(
     } catch (err: any) {
       log.error('Error asking question', { error: err.message });
       socket.emit('error', { message: 'Failed to submit question' });
+      if (callback) callback({ error: 'Failed to submit question' });
     }
   });
 
@@ -107,36 +112,44 @@ export function registerQAHandlers(
   // This is an improvement over the Slido reference which allowed duplicate votes.
   // -------------------------------------------------------------------------
   socket.on('upvote-question', async (data: { questionId: string }, callback?: Function) => {
-    if (!checkRateLimit(socket, 'upvote-question')) return;
+    if (!checkRateLimit(socket, 'upvote-question')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
 
     try {
       const parsed = idSchema.safeParse(data.questionId);
-      if (!parsed.success) return;
+      if (!parsed.success) {
+        if (callback) callback({ error: 'Invalid question' });
+        return;
+      }
 
       const questionId = parsed.data;
 
-      // Check if the user already upvoted this question
-      const existingUpvote = await prisma.upvote.findUnique({
-        where: {
-          questionId_userId: { questionId, userId: user.userId },
-        },
-      });
-
-      if (existingUpvote) {
-        // Already upvoted → remove the upvote (toggle OFF)
-        await prisma.upvote.delete({
-          where: { id: existingUpvote.id },
+      // Toggle the upvote atomically to avoid a unique-constraint race when the
+      // same user fires concurrent upvotes. We first try to delete an existing
+      // upvote; if nothing was deleted, we create one. deleteMany/create are
+      // idempotent against the @@unique([questionId, userId]) constraint and the
+      // whole toggle runs inside a single transaction.
+      const { hasUpvoted, upvoteCount } = await prisma.$transaction(async (tx) => {
+        const removed = await tx.upvote.deleteMany({
+          where: { questionId, userId: user.userId },
         });
-      } else {
-        // Not upvoted → add the upvote (toggle ON)
-        await prisma.upvote.create({
-          data: { questionId, userId: user.userId },
-        });
-      }
 
-      // Get updated upvote count
-      const upvoteCount = await prisma.upvote.count({
-        where: { questionId },
+        let nowUpvoted: boolean;
+        if (removed.count > 0) {
+          // Existing upvote removed (toggle OFF)
+          nowUpvoted = false;
+        } else {
+          // No existing upvote → add one (toggle ON)
+          await tx.upvote.create({
+            data: { questionId, userId: user.userId },
+          });
+          nowUpvoted = true;
+        }
+
+        const count = await tx.upvote.count({ where: { questionId } });
+        return { hasUpvoted: nowUpvoted, upvoteCount: count };
       });
 
       // Broadcast updated upvote count to all participants
@@ -163,9 +176,10 @@ export function registerQAHandlers(
         }
       }
 
-      if (callback) callback({ upvoteCount, hasUpvoted: !existingUpvote });
+      if (callback) callback({ upvoteCount, hasUpvoted });
     } catch (err: any) {
       log.error('Error toggling upvote', { error: err.message });
+      if (callback) callback({ error: 'Failed to toggle upvote' });
     }
   });
 

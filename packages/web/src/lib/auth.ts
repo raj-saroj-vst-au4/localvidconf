@@ -3,6 +3,7 @@ import CredentialsProvider from 'next-auth/providers/credentials';
 import bcrypt from 'bcryptjs';
 import jwtLib from 'jsonwebtoken';
 import prisma from './prisma';
+import { verifyAndConsumeCaptcha } from './validators';
 
 export const authOptions: NextAuthOptions = {
   providers: [
@@ -17,16 +18,13 @@ export const authOptions: NextAuthOptions = {
       async authorize(credentials) {
         if (!credentials?.email || !credentials?.password) return null;
 
-        // Verify captcha
-        try {
-          const decoded = jwtLib.verify(
+        // Verify captcha (single-use: rejects expired, wrong, or replayed tokens)
+        if (
+          !verifyAndConsumeCaptcha(
             credentials.captchaToken || '',
-            process.env.NEXTAUTH_SECRET!
-          ) as any;
-          if (decoded.type !== 'captcha' || decoded.answer !== Number(credentials.captchaAnswer)) {
-            return null;
-          }
-        } catch {
+            Number(credentials.captchaAnswer)
+          )
+        ) {
           return null;
         }
 
@@ -81,7 +79,7 @@ export const authOptions: NextAuthOptions = {
           picture: token.picture,
         },
         process.env.NEXTAUTH_SECRET!,
-        { expiresIn: '30d' }
+        { expiresIn: '2h', algorithm: 'HS256' }
       );
       return session;
     },

@@ -39,6 +39,9 @@ const EVENT_CATEGORIES: Record<string, string> = {
   'send-chat': 'chat',
   'ask-question': 'chat',
   'upvote-question': 'chat',
+  'send-reaction': 'chat',
+  'raise-hand': 'chat',
+  'lower-hand': 'chat',
   'pin-question': 'admin',
   'mark-answered': 'admin',
   'close-producer': 'media',
@@ -48,10 +51,25 @@ const EVENT_CATEGORIES: Record<string, string> = {
   'lobby-reject': 'admin',
   'move-to-lobby': 'admin',
   'invite-participant': 'admin',
+  'mute-all': 'admin',
+  'mute-participant': 'admin',
+  'promote-cohost': 'admin',
+  'demote-cohost': 'admin',
 };
 
-// Per-socket event counters: Map<socketId, Map<category, { count, resetTime }>>
+// Per-identity event counters: Map<counterKey, Map<category, { count, resetTime }>>
+// counterKey is the authenticated user id when available, otherwise the socket id.
 const counters = new Map<string, Map<string, { count: number; resetTime: number }>>();
+
+/**
+ * Resolve the counter key for a socket. Keying on the authenticated user id
+ * (when present) prevents trivial reconnect-resets where a client drops and
+ * reopens the socket to obtain a fresh per-socket counter. Falls back to the
+ * socket id only for unauthenticated connections.
+ */
+function getCounterKey(socket: Socket): string {
+  return socket.data?.user?.userId ?? socket.id;
+}
 
 /**
  * Check if a socket event should be rate-limited.
@@ -61,12 +79,13 @@ export function checkRateLimit(socket: Socket, eventName: string): boolean {
   const category = EVENT_CATEGORIES[eventName] || 'default';
   const limit = LIMITS[category] || LIMITS.default;
   const now = Date.now();
+  const counterKey = getCounterKey(socket);
 
-  // Initialize counter map for this socket if needed
-  if (!counters.has(socket.id)) {
-    counters.set(socket.id, new Map());
+  // Initialize counter map for this identity if needed
+  if (!counters.has(counterKey)) {
+    counters.set(counterKey, new Map());
   }
-  const socketCounters = counters.get(socket.id)!;
+  const socketCounters = counters.get(counterKey)!;
 
   // Get or initialize counter for this category
   let counter = socketCounters.get(category);
@@ -80,6 +99,7 @@ export function checkRateLimit(socket: Socket, eventName: string): boolean {
 
   if (counter.count > limit.maxEvents) {
     log.warn('Rate limit exceeded', {
+      counterKey,
       socketId: socket.id,
       event: eventName,
       category,
@@ -95,6 +115,11 @@ export function checkRateLimit(socket: Socket, eventName: string): boolean {
 /**
  * Clean up counters when a socket disconnects.
  * Prevents memory leaks from accumulating counter maps.
+ *
+ * Accepts the disconnecting key, which may be a socket id (unauthenticated
+ * connections) or an authenticated user id. For authenticated users that may
+ * still have other live sockets the user-keyed entry is intentionally kept;
+ * the sliding window makes any stale entry self-expiring and harmless.
  */
 export function cleanupRateLimitCounters(socketId: string): void {
   counters.delete(socketId);

@@ -24,8 +24,10 @@ import rateLimit from 'express-rate-limit';
 import { PrismaClient } from '@prisma/client';
 import * as mediasoup from 'mediasoup';
 import { types as mediasoupTypes } from 'mediasoup';
+import jwt from 'jsonwebtoken';
 
 // Config
+import { validateEnv, env } from './config/env';
 import { CORS_OPTIONS } from './config/cors';
 import { WORKER_SETTINGS, NUM_WORKERS, MEDIA_CODECS } from './config/mediasoup';
 
@@ -46,6 +48,11 @@ import { socketAuthMiddleware } from './middleware/socketAuth';
 import { createLogger } from './utils/logger';
 
 const log = createLogger('Server');
+
+// Validate environment configuration before anything else so bad/missing
+// env fails fast at boot rather than surfacing as obscure runtime errors.
+validateEnv();
+
 const PORT = parseInt(process.env.PORT || '4000');
 
 // --- Global State ---
@@ -55,6 +62,38 @@ const prisma = new PrismaClient();
 const rooms = new Map<string, Room>();                         // meetingCode → Room
 const workers: mediasoupTypes.Worker[] = [];                   // mediasoup worker pool
 let workerIndex = 0;                                           // Round-robin worker assignment
+
+// Module-scoped graceful-shutdown handle. Assigned in start() once the server
+// is wired up, so process-level crash handlers can reuse the same teardown path.
+let shutdown: ((exitCode?: number) => Promise<void>) | undefined;
+let shuttingDown = false;
+
+// --- Process-level crash safety ---
+// A media server is long-lived; an unhandled rejection or thrown error must be
+// logged loudly and (for hard failures) drive a graceful shutdown rather than
+// leaving a half-dead process that the orchestrator keeps routing traffic to.
+process.on('unhandledRejection', (reason) => {
+  log.error('Unhandled promise rejection', {
+    error: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
+});
+
+process.on('uncaughtException', (err) => {
+  log.error('Uncaught exception', { error: err?.message, stack: err?.stack });
+  // Attempt a best-effort graceful shutdown, then exit non-zero. Guard against
+  // re-entry if the exception fires mid-shutdown.
+  if (shutdown && !shuttingDown) {
+    shutdown(1).catch((e) => {
+      log.error('Error during shutdown after uncaughtException', {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      process.exit(1);
+    });
+  } else {
+    process.exit(1);
+  }
+});
 
 // =============================================================================
 // 1. Initialize Express with Security Middleware
@@ -96,10 +135,30 @@ app.get('/turn-credentials', (req, res) => {
     return res.status(500).json({ error: 'TURN secret not configured' });
   }
 
-  // Time-limited credentials: valid for 24 hours
+  // Require a valid NextAuth JWT before handing out TURN credentials.
+  // Token may arrive via the Authorization header ("Bearer <t>") or ?token=.
+  const authHeader = req.headers.authorization || '';
+  const headerToken = authHeader.startsWith('Bearer ')
+    ? authHeader.slice('Bearer '.length).trim()
+    : '';
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+  const token = headerToken || queryToken;
+
+  const secret = process.env.NEXTAUTH_SECRET;
+  if (!token || !secret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    jwt.verify(token, secret, { algorithms: ['HS256'] });
+  } catch (err: any) {
+    log.warn('turn-credentials rejected: invalid token', { error: err?.message });
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Time-limited credentials: valid for 1 hour
   // The TURN server validates these using the shared secret
   const crypto = require('crypto');
-  const unixTimestamp = Math.floor(Date.now() / 1000) + 24 * 3600; // 24h from now
+  const unixTimestamp = Math.floor(Date.now() / 1000) + 3600; // 1h from now
   const username = `${unixTimestamp}:meetuser`;
   const hmac = crypto.createHmac('sha1', turnSecret);
   hmac.update(username);
@@ -137,6 +196,11 @@ const io = new SocketServer(httpServer, {
   transports: ['websocket', 'polling'],
   // Increase max payload for RTP parameters (can be large)
   maxHttpBufferSize: 1e6, // 1 MB
+  // Heartbeat / liveness tuning: detect and reap dead connections promptly so
+  // a hung peer (or a stalled upstream proxy) doesn't linger as a ghost.
+  pingInterval: 25000,
+  pingTimeout: 20000,
+  connectTimeout: 20000,
 });
 
 // --- Socket.IO Authentication Middleware ---
@@ -158,15 +222,23 @@ async function createWorkers(): Promise<void> {
     worker.on('died', (error) => {
       // Worker died: this is a critical error. In production, you'd restart the process.
       log.error(`mediasoup worker ${i} died!`, { error: error?.message });
-      // Remove the dead worker and create a replacement
+      const deadPid = worker.pid;
+
+      // Remove the dead worker from the pool
       const idx = workers.indexOf(worker);
       if (idx !== -1) workers.splice(idx, 1);
 
-      // Create a replacement worker
+      // Create a replacement worker, then keep round-robin in range
       mediasoup.createWorker(WORKER_SETTINGS).then(newWorker => {
         workers.push(newWorker);
+        // Recompute the round-robin cursor against the (now changed) pool size.
+        workerIndex = workers.length > 0 ? workerIndex % workers.length : 0;
         log.info('Replacement worker created');
       });
+
+      // The dead worker took its routers (and thus their rooms) down with it.
+      // Tear those rooms down and notify their peers so clients can recover.
+      terminateRoomsForWorker(deadPid);
     });
 
     workers.push(worker);
@@ -179,9 +251,43 @@ async function createWorkers(): Promise<void> {
  * Distributes rooms evenly across workers for load balancing.
  */
 function getNextWorker(): mediasoupTypes.Worker {
+  if (workers.length === 0) {
+    throw new Error('No mediasoup workers available');
+  }
+  // Guard against workerIndex drifting out of range after the pool shrinks.
+  workerIndex = workerIndex % workers.length;
   const worker = workers[workerIndex];
   workerIndex = (workerIndex + 1) % workers.length;
   return worker;
+}
+
+/**
+ * Tear down every Room whose main router lived on a now-dead worker.
+ * mediasoup does not expose a router's owning worker, so we tag each router's
+ * appData with the worker pid at creation time and match on that here.
+ * Each affected room is closed, its peers notified, and removed from the map.
+ */
+function terminateRoomsForWorker(deadPid: number): void {
+  for (const [code, room] of rooms) {
+    const router = room.getRouter();
+    if ((router.appData as { workerPid?: number }).workerPid !== deadPid) continue;
+
+    log.error('Tearing down room on dead worker', {
+      meetingCode: code,
+      meetingId: room.meetingId,
+      deadPid,
+    });
+
+    // Notify everyone in the room before we destroy server-side state.
+    // Peers are joined to the `meeting:<code>` Socket.IO room (see connectionHandler).
+    io.to(`meeting:${code}`).emit('room-terminated', {
+      meetingCode: code,
+      reason: 'media-worker-failure',
+    });
+
+    room.close();
+    rooms.delete(code);
+  }
 }
 
 /**
@@ -193,9 +299,21 @@ async function getOrCreateRoom(meetingId: string, meetingCode: string): Promise<
   let room = rooms.get(meetingCode);
   if (room) return room;
 
+  // Admission control: cap the number of concurrent rooms this instance hosts.
+  // Throw so the caller can reject the join with a clear, actionable error
+  // instead of silently overcommitting workers and degrading every meeting.
+  if (rooms.size >= env.MAX_ROOMS) {
+    throw new Error('Server at capacity: maximum number of rooms reached');
+  }
+
   // Create a new Router on the next available worker
   const worker = getNextWorker();
-  const router = await worker.createRouter({ mediaCodecs: MEDIA_CODECS });
+  // Tag the router with its owning worker pid so we can find and tear down
+  // its rooms if that worker dies (mediasoup doesn't expose this linkage).
+  const router = await worker.createRouter({
+    mediaCodecs: MEDIA_CODECS,
+    appData: { workerPid: worker.pid },
+  });
 
   room = new Room(meetingId, meetingCode, router);
   rooms.set(meetingCode, room);
@@ -246,6 +364,25 @@ async function start(): Promise<void> {
     await prisma.$connect();
     log.info('Database connected');
 
+    // --- Crash reconciliation ---
+    // A previous crash can leave participant rows stuck in an "active" state
+    // (this instance never ran their disconnect handler). Clear them once, here,
+    // AFTER the DB is connected but BEFORE we accept any connections, so stale
+    // rows don't pollute presence/headcounts.
+    //
+    // NOTE: the audit text said status: 'LEFT', but the ParticipantStatus enum
+    // has no LEFT member (IN_LOBBY | IN_MEETING | IN_BREAKOUT | REMOVED). We use
+    // the schema-valid terminal status 'REMOVED' + leftAt, matching how kicked
+    // participants are recorded elsewhere, so this neither type-errors nor
+    // throws at runtime.
+    const reconciled = await prisma.participant.updateMany({
+      where: { status: { in: ['IN_MEETING', 'IN_BREAKOUT'] } },
+      data: { status: 'REMOVED', leftAt: new Date() },
+    });
+    log.info('Reconciled stale participant rows from previous run', {
+      count: reconciled.count,
+    });
+
     // Create mediasoup workers
     await createWorkers();
     log.info(`${workers.length} mediasoup workers ready`);
@@ -261,29 +398,63 @@ async function start(): Promise<void> {
     });
 
     // --- Graceful Shutdown ---
-    // Close connections cleanly when the process is stopped
-    const shutdown = async () => {
-      log.info('Shutting down...');
+    // Close cleanly when stopped. Order matters:
+    //   1. io.close()           - stop accepting new sockets / drop transports
+    //   2. httpServer.close()   - stop accepting HTTP, drain in-flight (10s cap)
+    //   3. close workers        - tear down mediasoup media processes
+    //   4. prisma.$disconnect() - release DB connections
+    //   5. process.exit()       - only after everything above has settled
+    shutdown = async (exitCode = 0) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      log.info('Shutting down...', { exitCode });
       reminderScheduler.stop();
 
-      // Close all rooms
-      for (const [code, room] of rooms) {
+      // 1. Stop accepting new Socket.IO connections.
+      try {
+        await new Promise<void>((resolve) => io.close(() => resolve()));
+      } catch (e) {
+        log.error('Error closing Socket.IO server', {
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
+      // 2. Stop the HTTP server, but don't hang forever if a connection wedges.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          log.warn('HTTP server close timed out; forcing shutdown');
+          resolve();
+        }, 10000);
+        httpServer.close(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+
+      // 3. Close all rooms and mediasoup workers.
+      for (const room of rooms.values()) {
         room.close();
       }
       rooms.clear();
-
-      // Close all mediasoup workers
       for (const worker of workers) {
         worker.close();
       }
 
-      await prisma.$disconnect();
-      httpServer.close();
-      process.exit(0);
+      // 4. Release the database.
+      try {
+        await prisma.$disconnect();
+      } catch (e) {
+        log.error('Error disconnecting Prisma', {
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
+      // 5. Now it's safe to exit.
+      process.exit(exitCode);
     };
 
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', () => shutdown?.());
+    process.on('SIGTERM', () => shutdown?.());
 
   } catch (err: any) {
     log.error('Failed to start server', { error: err.message });

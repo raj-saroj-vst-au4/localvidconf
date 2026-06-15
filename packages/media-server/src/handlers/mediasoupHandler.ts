@@ -36,6 +36,28 @@ export function registerMediasoupHandlers(
 ): void {
 
   // -------------------------------------------------------------------------
+  // BREAKOUT ROUTING HELPER
+  // When the peer has been moved into a breakout room, all of their media
+  // (transports/consumers) must live on that breakout's router instead of the
+  // main router. socket.data.breakoutRoomId is set by the breakout handler when
+  // a peer is moved, and cleared when breakouts close. Returns undefined when
+  // the peer is in the main room (preserving original main-room behavior).
+  // -------------------------------------------------------------------------
+  const getActiveRouter = (room: Room): mediasoupTypes.Router | undefined => {
+    const breakoutRoomId = socket.data.breakoutRoomId as string | undefined;
+    if (!breakoutRoomId) return undefined;
+    const breakoutRouter = room.getBreakoutRouter(breakoutRoomId);
+    if (!breakoutRouter) {
+      log.warn('Breakout router not found for peer; falling back to main router', {
+        breakoutRoomId,
+        socketId: socket.id,
+      });
+      return undefined;
+    }
+    return breakoutRouter;
+  };
+
+  // -------------------------------------------------------------------------
   // CREATE TRANSPORT
   // Client requests a WebRTC transport for either sending or receiving.
   // Returns ICE/DTLS parameters that the client needs for the handshake.
@@ -44,7 +66,10 @@ export function registerMediasoupHandlers(
     data: { direction: 'send' | 'recv' },
     callback: Function
   ) => {
-    if (!checkRateLimit(socket, 'create-transport')) return;
+    if (!checkRateLimit(socket, 'create-transport')) {
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
 
     try {
       const room = rooms.get(socket.data.meetingCode);
@@ -53,8 +78,13 @@ export function registerMediasoupHandlers(
       const peer = room.getPeer(socket.id);
       if (!peer) return callback({ error: 'Peer not found' });
 
-      // Create the transport on the Room's router
-      const transport = await room.createTransport(data.direction, peer);
+      // Create the transport on the Room's router (or the peer's breakout
+      // router when they've been moved into a breakout room).
+      const transport = await room.createTransport(
+        data.direction,
+        peer,
+        getActiveRouter(room)
+      );
 
       // Return transport parameters to the client
       // The client uses these to initialize its local transport
@@ -79,7 +109,10 @@ export function registerMediasoupHandlers(
     data: { transportId: string; dtlsParameters: mediasoupTypes.DtlsParameters },
     callback: Function
   ) => {
-    if (!checkRateLimit(socket, 'connect-transport')) return;
+    if (!checkRateLimit(socket, 'connect-transport')) {
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
 
     try {
       const room = rooms.get(socket.data.meetingCode);
@@ -125,7 +158,10 @@ export function registerMediasoupHandlers(
     },
     callback: Function
   ) => {
-    if (!checkRateLimit(socket, 'produce')) return;
+    if (!checkRateLimit(socket, 'produce')) {
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
 
     try {
       const room = rooms.get(socket.data.meetingCode);
@@ -134,7 +170,9 @@ export function registerMediasoupHandlers(
       const peer = room.getPeer(socket.id);
       if (!peer) return callback({ error: 'Peer not found' });
 
-      // Create the producer on the peer's send transport
+      // Create the producer on the peer's send transport. The transport is
+      // already bound to the correct (main or breakout) router, so no override
+      // is needed here.
       const producer = await room.createProducer(
         peer,
         data.transportId,
@@ -143,9 +181,14 @@ export function registerMediasoupHandlers(
         data.appData
       );
 
-      // Notify all other peers in the room about this new producer
-      // They'll create consumers to receive this stream
-      socket.to(`meeting:${socket.data.meetingCode}`).emit('new-producer', {
+      // Notify the other peers about this new producer so they can consume it.
+      // Scope the notification to the breakout socket room when the producer is
+      // in a breakout, otherwise to the main meeting room.
+      const breakoutRoomId = socket.data.breakoutRoomId as string | undefined;
+      const targetRoom = breakoutRoomId
+        ? `breakout:${breakoutRoomId}`
+        : `meeting:${socket.data.meetingCode}`;
+      socket.to(targetRoom).emit('new-producer', {
         peerId: socket.id,
         participantId: peer.participantId,
         producerId: producer.id,
@@ -171,8 +214,6 @@ export function registerMediasoupHandlers(
     data: { producerId: string; rtpCapabilities: mediasoupTypes.RtpCapabilities },
     callback?: Function
   ) => {
-    if (!checkRateLimit(socket, 'consume')) return;
-
     // Support both callback and event-based responses
     const respond = (result: any) => {
       if (typeof callback === 'function') {
@@ -184,6 +225,11 @@ export function registerMediasoupHandlers(
       }
     };
 
+    if (!checkRateLimit(socket, 'consume')) {
+      respond({ error: 'rate_limited' });
+      return;
+    }
+
     try {
       const room = rooms.get(socket.data.meetingCode);
       if (!room) return respond({ error: 'Not in a meeting' });
@@ -191,9 +237,15 @@ export function registerMediasoupHandlers(
       const consumerPeer = room.getPeer(socket.id);
       if (!consumerPeer) return respond({ error: 'Peer not found' });
 
-      // Find the producer's peer
+      // Find the producer's peer within the same routing scope. In a breakout
+      // room the producer lives on that breakout's peer map; in the main room it
+      // lives on the main peer map.
+      const breakoutRoomId = socket.data.breakoutRoomId as string | undefined;
+      const searchPeers = breakoutRoomId
+        ? room.getBreakoutPeers(breakoutRoomId)
+        : room.getPeers();
       let producerPeer: any = null;
-      for (const [, p] of room.getPeers()) {
+      for (const [, p] of searchPeers) {
         if (p.getProducer(data.producerId)) {
           producerPeer = p;
           break;
@@ -201,12 +253,14 @@ export function registerMediasoupHandlers(
       }
       if (!producerPeer) return respond({ error: 'Producer not found' });
 
-      // Create the consumer
+      // Create the consumer on the active router (breakout router when the peer
+      // is in a breakout, otherwise the main router).
       const consumer = await room.createConsumer(
         consumerPeer,
         producerPeer,
         data.producerId,
-        data.rtpCapabilities
+        data.rtpCapabilities,
+        getActiveRouter(room)
       );
 
       if (!consumer) return respond({ error: 'Cannot consume this producer' });
@@ -233,7 +287,10 @@ export function registerMediasoupHandlers(
     data: { consumerId: string },
     callback: Function
   ) => {
-    if (!checkRateLimit(socket, 'resume-consumer')) return;
+    if (!checkRateLimit(socket, 'resume-consumer')) {
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
 
     try {
       const room = rooms.get(socket.data.meetingCode);
@@ -262,7 +319,10 @@ export function registerMediasoupHandlers(
     data: { consumerId: string; spatialLayer: number; temporalLayer: number },
     callback?: Function
   ) => {
-    if (!checkRateLimit(socket, 'set-preferred-layers')) return;
+    if (!checkRateLimit(socket, 'set-preferred-layers')) {
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
 
     try {
       const room = rooms.get(socket.data.meetingCode);
@@ -283,6 +343,7 @@ export function registerMediasoupHandlers(
       if (callback) callback({ success: true });
     } catch (err: any) {
       log.error('Error setting layers', { error: err.message });
+      if (typeof callback === 'function') callback({ error: 'Failed to set layers' });
     }
   });
 
@@ -294,7 +355,10 @@ export function registerMediasoupHandlers(
     data: { producerId: string },
     callback?: Function
   ) => {
-    if (!checkRateLimit(socket, 'pause-producer')) return;
+    if (!checkRateLimit(socket, 'pause-producer')) {
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
 
     try {
       const room = rooms.get(socket.data.meetingCode);
@@ -308,8 +372,13 @@ export function registerMediasoupHandlers(
 
       await producer.pause();
 
-      // Notify other peers so they can show muted indicator
-      socket.to(`meeting:${socket.data.meetingCode}`).emit('producer-paused', {
+      // Notify other peers so they can show muted indicator. Scope to the
+      // breakout socket room when the peer is in a breakout.
+      const breakoutRoomId = socket.data.breakoutRoomId as string | undefined;
+      const targetRoom = breakoutRoomId
+        ? `breakout:${breakoutRoomId}`
+        : `meeting:${socket.data.meetingCode}`;
+      socket.to(targetRoom).emit('producer-paused', {
         producerId: data.producerId,
         peerId: socket.id,
       });
@@ -317,6 +386,7 @@ export function registerMediasoupHandlers(
       if (callback) callback({ paused: true });
     } catch (err: any) {
       log.error('Error pausing producer', { error: err.message });
+      if (typeof callback === 'function') callback({ error: 'Failed to pause producer' });
     }
   });
 
@@ -324,7 +394,10 @@ export function registerMediasoupHandlers(
     data: { producerId: string },
     callback?: Function
   ) => {
-    if (!checkRateLimit(socket, 'resume-producer')) return;
+    if (!checkRateLimit(socket, 'resume-producer')) {
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
 
     try {
       const room = rooms.get(socket.data.meetingCode);
@@ -338,7 +411,12 @@ export function registerMediasoupHandlers(
 
       await producer.resume();
 
-      socket.to(`meeting:${socket.data.meetingCode}`).emit('producer-resumed', {
+      // Scope to the breakout socket room when the peer is in a breakout.
+      const breakoutRoomId = socket.data.breakoutRoomId as string | undefined;
+      const targetRoom = breakoutRoomId
+        ? `breakout:${breakoutRoomId}`
+        : `meeting:${socket.data.meetingCode}`;
+      socket.to(targetRoom).emit('producer-resumed', {
         producerId: data.producerId,
         peerId: socket.id,
       });
@@ -346,6 +424,7 @@ export function registerMediasoupHandlers(
       if (callback) callback({ resumed: true });
     } catch (err: any) {
       log.error('Error resuming producer', { error: err.message });
+      if (typeof callback === 'function') callback({ error: 'Failed to resume producer' });
     }
   });
 
@@ -357,6 +436,11 @@ export function registerMediasoupHandlers(
     data: { producerId: string },
     callback?: Function
   ) => {
+    if (!checkRateLimit(socket, 'close-producer')) {
+      if (typeof callback === 'function') callback({ error: 'rate_limited' });
+      return;
+    }
+
     try {
       const room = rooms.get(socket.data.meetingCode);
       if (!room) return;
@@ -370,8 +454,13 @@ export function registerMediasoupHandlers(
       producer.close();
       peer.removeProducer(data.producerId);
 
-      // Notify other peers to remove this stream
-      socket.to(`meeting:${socket.data.meetingCode}`).emit('producer-closed', {
+      // Notify other peers to remove this stream. Scope to the breakout socket
+      // room when the peer is in a breakout.
+      const breakoutRoomId = socket.data.breakoutRoomId as string | undefined;
+      const targetRoom = breakoutRoomId
+        ? `breakout:${breakoutRoomId}`
+        : `meeting:${socket.data.meetingCode}`;
+      socket.to(targetRoom).emit('producer-closed', {
         producerId: data.producerId,
         peerId: socket.id,
       });
@@ -379,6 +468,7 @@ export function registerMediasoupHandlers(
       if (callback) callback({ closed: true });
     } catch (err: any) {
       log.error('Error closing producer', { error: err.message });
+      if (typeof callback === 'function') callback({ error: 'Failed to close producer' });
     }
   });
 }

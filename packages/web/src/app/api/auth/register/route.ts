@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 import prisma from '@/lib/prisma';
-import { registerSchema } from '@/lib/validators';
+import { registerSchema, verifyAndConsumeCaptcha } from '@/lib/validators';
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
@@ -13,14 +12,9 @@ export async function POST(req: NextRequest) {
 
   const { email, password, name, captchaToken, captchaAnswer } = parsed.data;
 
-  // Verify captcha
-  try {
-    const decoded = jwt.verify(captchaToken, process.env.NEXTAUTH_SECRET!) as any;
-    if (decoded.type !== 'captcha' || decoded.answer !== captchaAnswer) {
-      return NextResponse.json({ error: 'Incorrect captcha answer' }, { status: 400 });
-    }
-  } catch {
-    return NextResponse.json({ error: 'Captcha expired or invalid' }, { status: 400 });
+  // Verify captcha (single-use: rejects expired, wrong, or already-consumed tokens)
+  if (!verifyAndConsumeCaptcha(captchaToken, captchaAnswer)) {
+    return NextResponse.json({ error: 'Captcha expired, invalid, or already used' }, { status: 400 });
   }
 
   // Check existing user

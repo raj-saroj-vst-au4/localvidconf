@@ -16,13 +16,19 @@ import { joinMeetingRoom } from './connectionHandler';
 import { createLogger } from '../utils/logger';
 import { checkRateLimit } from '../middleware/rateLimiter';
 import { z } from 'zod';
-import nodemailer from 'nodemailer';
+import { sendMail, escapeHtml } from '../utils/mailer';
 
 const log = createLogger('MeetingHandler');
 
 // Validation schemas for admin actions
 const emailSchema = z.string().email().max(320);
 const idSchema = z.string().cuid();
+
+// Allowlist of reactions clients may broadcast (emoji or short names).
+const ALLOWED_REACTIONS = new Set<string>([
+  '👍', '❤️', '😂', '😮', '🎉', '👏',
+  'thumbsup', 'heart', 'laugh', 'wow', 'tada', 'clap',
+]);
 
 /**
  * Helper: verify the socket user is HOST or CO_HOST of their current meeting.
@@ -42,21 +48,6 @@ async function verifyHostRole(
     socket.emit('error', { message: 'Only host or co-host can perform this action' });
   }
   return participant;
-}
-
-/**
- * Create SMTP transporter for sending invitation emails.
- */
-function createMailTransporter() {
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST || 'smtp.gmail.com',
-    port: parseInt(process.env.SMTP_PORT || '587'),
-    secure: false,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASSWORD,
-    },
-  });
 }
 
 export function registerMeetingHandlers(
@@ -437,20 +428,21 @@ export function registerMeetingHandlers(
         },
       });
 
-      // Send invitation email
-      const transporter = createMailTransporter();
+      // Send invitation email via the shared pooled transporter.
+      // Escape user-controlled values to prevent HTML/email injection.
       const joinUrl = `${process.env.NEXTAUTH_URL || 'http://localhost:3000'}/meeting/${meetingCode}`;
+      const safeInviterName = escapeHtml(user.name);
+      const safeMeetingTitle = escapeHtml(meeting.title);
 
-      await transporter.sendMail({
-        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      await sendMail({
         to: data.email,
         subject: `${user.name} invited you to: ${meeting.title}`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
             <h2 style="color: #2196f3;">You're invited to join a meeting</h2>
-            <p><strong>${user.name}</strong> has invited you to join:</p>
+            <p><strong>${safeInviterName}</strong> has invited you to join:</p>
             <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
-              <h3 style="margin: 0 0 10px;">${meeting.title}</h3>
+              <h3 style="margin: 0 0 10px;">${safeMeetingTitle}</h3>
               <p style="margin: 0; color: #666;">Meeting Code: <strong>${meetingCode}</strong></p>
             </div>
             <a href="${joinUrl}"
@@ -472,6 +464,283 @@ export function registerMeetingHandlers(
     } catch (err: any) {
       log.error('Error sending invitation', { error: err.message });
       socket.emit('error', { message: 'Failed to send invitation' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // MUTE ALL
+  // Host asks all participants (except the host) to pause their microphone.
+  // -------------------------------------------------------------------------
+  socket.on('mute-all', async (_: unknown, callback?: Function) => {
+    if (!checkRateLimit(socket, 'mute-all')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
+
+    try {
+      const hostParticipant = await verifyHostRole(socket, prisma);
+      if (!hostParticipant) {
+        if (callback) callback({ error: 'Not authorized' });
+        return;
+      }
+
+      const meetingCode = socket.data.meetingCode;
+
+      // Broadcast to everyone in the meeting except the host's own socket.
+      socket.to(`meeting:${meetingCode}`).emit('force-mute', {});
+
+      log.info('Mute-all issued', { meetingCode, by: user.email });
+
+      if (callback) callback({ success: true });
+    } catch (err: any) {
+      log.error('Error muting all', { error: err.message });
+      if (callback) callback({ error: 'Failed to mute all' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // MUTE PARTICIPANT
+  // Host asks a single participant to pause their microphone.
+  // -------------------------------------------------------------------------
+  socket.on('mute-participant', async (data: { participantId: string }, callback?: Function) => {
+    if (!checkRateLimit(socket, 'mute-participant')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
+
+    try {
+      const hostParticipant = await verifyHostRole(socket, prisma);
+      if (!hostParticipant) {
+        if (callback) callback({ error: 'Not authorized' });
+        return;
+      }
+
+      if (!idSchema.safeParse(data.participantId).success) {
+        if (callback) callback({ error: 'Invalid participant' });
+        return;
+      }
+
+      const meetingCode = socket.data.meetingCode;
+
+      // Scope to this meeting (prevent cross-meeting IDOR).
+      const target = await prisma.participant.findFirst({
+        where: { id: data.participantId, meetingId: socket.data.meetingId },
+        select: { id: true },
+      });
+      if (!target) {
+        if (callback) callback({ error: 'Participant is not in this meeting' });
+        return;
+      }
+
+      // Emit force-mute to every socket belonging to that participant.
+      const meetingRoom = io.sockets.adapter.rooms.get(`meeting:${meetingCode}`);
+      if (meetingRoom) {
+        for (const socketId of meetingRoom) {
+          const targetSocket = io.sockets.sockets.get(socketId);
+          if (targetSocket && targetSocket.data.participantId === data.participantId) {
+            targetSocket.emit('force-mute', {});
+          }
+        }
+      }
+
+      log.info('Mute-participant issued', {
+        meetingCode,
+        participantId: data.participantId,
+        by: user.email,
+      });
+
+      if (callback) callback({ success: true });
+    } catch (err: any) {
+      log.error('Error muting participant', { error: err.message });
+      if (callback) callback({ error: 'Failed to mute participant' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // PROMOTE CO-HOST
+  // Host promotes a participant to CO_HOST.
+  // -------------------------------------------------------------------------
+  socket.on('promote-cohost', async (data: { participantId: string }, callback?: Function) => {
+    if (!checkRateLimit(socket, 'promote-cohost')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
+
+    try {
+      const hostParticipant = await verifyHostRole(socket, prisma);
+      if (!hostParticipant) {
+        if (callback) callback({ error: 'Not authorized' });
+        return;
+      }
+
+      if (!idSchema.safeParse(data.participantId).success) {
+        if (callback) callback({ error: 'Invalid participant' });
+        return;
+      }
+
+      const meetingCode = socket.data.meetingCode;
+
+      // Scope to this meeting (prevent cross-meeting IDOR).
+      const updated = await prisma.participant.updateMany({
+        where: { id: data.participantId, meetingId: socket.data.meetingId, role: 'PARTICIPANT' },
+        data: { role: 'CO_HOST' },
+      });
+      if (updated.count === 0) {
+        if (callback) callback({ error: 'Participant cannot be promoted' });
+        return;
+      }
+
+      io.to(`meeting:${meetingCode}`).emit('participant-role-changed', {
+        participantId: data.participantId,
+        role: 'CO_HOST',
+      });
+
+      log.info('Participant promoted to co-host', {
+        meetingCode,
+        participantId: data.participantId,
+        by: user.email,
+      });
+
+      if (callback) callback({ success: true });
+    } catch (err: any) {
+      log.error('Error promoting co-host', { error: err.message });
+      if (callback) callback({ error: 'Failed to promote co-host' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // DEMOTE CO-HOST
+  // Host demotes a co-host back to a regular participant.
+  // -------------------------------------------------------------------------
+  socket.on('demote-cohost', async (data: { participantId: string }, callback?: Function) => {
+    if (!checkRateLimit(socket, 'demote-cohost')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
+
+    try {
+      const hostParticipant = await verifyHostRole(socket, prisma);
+      if (!hostParticipant) {
+        if (callback) callback({ error: 'Not authorized' });
+        return;
+      }
+
+      if (!idSchema.safeParse(data.participantId).success) {
+        if (callback) callback({ error: 'Invalid participant' });
+        return;
+      }
+
+      const meetingCode = socket.data.meetingCode;
+
+      // Scope to this meeting and only demote co-hosts (never the HOST).
+      const updated = await prisma.participant.updateMany({
+        where: { id: data.participantId, meetingId: socket.data.meetingId, role: 'CO_HOST' },
+        data: { role: 'PARTICIPANT' },
+      });
+      if (updated.count === 0) {
+        if (callback) callback({ error: 'Participant cannot be demoted' });
+        return;
+      }
+
+      io.to(`meeting:${meetingCode}`).emit('participant-role-changed', {
+        participantId: data.participantId,
+        role: 'PARTICIPANT',
+      });
+
+      log.info('Co-host demoted to participant', {
+        meetingCode,
+        participantId: data.participantId,
+        by: user.email,
+      });
+
+      if (callback) callback({ success: true });
+    } catch (err: any) {
+      log.error('Error demoting co-host', { error: err.message });
+      if (callback) callback({ error: 'Failed to demote co-host' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // SEND REACTION
+  // Any participant can broadcast a short-lived emoji reaction.
+  // -------------------------------------------------------------------------
+  socket.on('send-reaction', async (data: { emoji: string }, callback?: Function) => {
+    if (!checkRateLimit(socket, 'send-reaction')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
+
+    try {
+      const emoji = typeof data?.emoji === 'string' ? data.emoji : '';
+      if (!ALLOWED_REACTIONS.has(emoji)) {
+        if (callback) callback({ error: 'Invalid reaction' });
+        return;
+      }
+
+      const meetingCode = socket.data.meetingCode;
+
+      io.to(`meeting:${meetingCode}`).emit('reaction', {
+        participantId: socket.data.participantId,
+        userName: user.name,
+        emoji,
+      });
+
+      if (callback) callback({ success: true });
+    } catch (err: any) {
+      log.error('Error sending reaction', { error: err.message });
+      if (callback) callback({ error: 'Failed to send reaction' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // RAISE HAND
+  // Any participant can raise their hand to request attention.
+  // -------------------------------------------------------------------------
+  socket.on('raise-hand', async (_: unknown, callback?: Function) => {
+    if (!checkRateLimit(socket, 'raise-hand')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
+
+    try {
+      const meetingCode = socket.data.meetingCode;
+
+      io.to(`meeting:${meetingCode}`).emit('hand-updated', {
+        participantId: socket.data.participantId,
+        userName: user.name,
+        raised: true,
+      });
+
+      if (callback) callback({ success: true });
+    } catch (err: any) {
+      log.error('Error raising hand', { error: err.message });
+      if (callback) callback({ error: 'Failed to raise hand' });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // LOWER HAND
+  // Any participant can lower their previously-raised hand.
+  // -------------------------------------------------------------------------
+  socket.on('lower-hand', async (_: unknown, callback?: Function) => {
+    if (!checkRateLimit(socket, 'lower-hand')) {
+      if (callback) callback({ error: 'Rate limited' });
+      return;
+    }
+
+    try {
+      const meetingCode = socket.data.meetingCode;
+
+      io.to(`meeting:${meetingCode}`).emit('hand-updated', {
+        participantId: socket.data.participantId,
+        userName: user.name,
+        raised: false,
+      });
+
+      if (callback) callback({ success: true });
+    } catch (err: any) {
+      log.error('Error lowering hand', { error: err.message });
+      if (callback) callback({ error: 'Failed to lower hand' });
     }
   });
 

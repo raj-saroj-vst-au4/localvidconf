@@ -13,6 +13,7 @@
 
 import { types as mediasoupTypes } from 'mediasoup';
 import os from 'os';
+import { env } from './env';
 
 // --- Worker Settings ---
 // Each worker runs as a separate OS process with its own thread.
@@ -20,9 +21,12 @@ import os from 'os';
 export const WORKER_SETTINGS: mediasoupTypes.WorkerSettings = {
   logLevel: 'warn',
   logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp'],
-  // Use half the available cores (leave headroom for Node.js and OS)
-  rtcMinPort: 40000,
-  rtcMaxPort: 40100,
+  // RTC port range for WebRTC media (UDP/TCP). Sourced from the validated env
+  // (RTC_MIN_PORT default 40000, RTC_MAX_PORT default 49999) so the range can be
+  // widened/narrowed per deployment without code changes. Must match the
+  // published port range on the container/firewall.
+  rtcMinPort: env.RTC_MIN_PORT,
+  rtcMaxPort: env.RTC_MAX_PORT,
 };
 
 // Number of mediasoup workers to spawn
@@ -101,6 +105,12 @@ export const WEBRTC_TRANSPORT_OPTIONS = {
 // --- Simulcast Encodings ---
 // Video is sent in 3 quality layers. The SFU selects the appropriate layer
 // based on the receiver's bandwidth. This is key for network optimization.
+//
+// SINGLE SOURCE OF TRUTH for produce/encoding parameters: SIMULCAST_ENCODINGS,
+// SCREEN_SHARE_ENCODING and MEDIA_PRIORITY below are the canonical encoding
+// definitions. The client currently duplicates these inline; it should import
+// these exports instead so server and client stay in sync. Do not delete — even
+// if they read as unused here, they are the contract consumed by the client.
 export const SIMULCAST_ENCODINGS = [
   {
     rid: 'r0',

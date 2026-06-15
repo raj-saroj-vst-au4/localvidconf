@@ -13,7 +13,7 @@
 import cron from 'node-cron';
 import { PrismaClient } from '@prisma/client';
 import { Server as SocketServer } from 'socket.io';
-import nodemailer from 'nodemailer';
+import { sendMail } from '../utils/mailer';
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('ReminderScheduler');
@@ -22,6 +22,9 @@ export class ReminderScheduler {
   private prisma: PrismaClient;
   private io: SocketServer;
   private cronJob: cron.ScheduledTask | null = null;
+  // Re-entrancy guard: prevents a slow run (slow SMTP) from overlapping the
+  // next cron tick, which could double-process reminders.
+  private isRunning = false;
 
   constructor(prisma: PrismaClient, io: SocketServer) {
     this.prisma = prisma;
@@ -56,6 +59,14 @@ export class ReminderScheduler {
    * A reminder is "due" if its triggerAt time has passed and it hasn't been sent.
    */
   private async processReminders(): Promise<void> {
+    // Skip this tick if a previous run is still in progress (e.g. slow SMTP),
+    // so runs never overlap and reminders are not double-sent.
+    if (this.isRunning) {
+      log.warn('Previous reminder cycle still running; skipping this tick');
+      return;
+    }
+    this.isRunning = true;
+
     try {
       const now = new Date();
 
@@ -108,6 +119,8 @@ export class ReminderScheduler {
       }
     } catch (err: any) {
       log.error('Error in reminder processing cycle', { error: err.message });
+    } finally {
+      this.isRunning = false;
     }
   }
 
@@ -115,16 +128,6 @@ export class ReminderScheduler {
    * Send email reminders to all participants of a meeting.
    */
   private async sendEmailReminder(reminder: any): Promise<void> {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST || 'smtp.gmail.com',
-      port: parseInt(process.env.SMTP_PORT || '587'),
-      secure: false,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASSWORD,
-      },
-    });
-
     const meeting = reminder.meeting;
     const joinUrl = `${process.env.NEXTAUTH_URL || 'http://localhost:3000'}/meeting/${meeting.code}`;
 
@@ -136,8 +139,7 @@ export class ReminderScheduler {
     // Send to all participants
     for (const participant of meeting.participants) {
       try {
-        await transporter.sendMail({
-          from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        await sendMail({
           to: participant.user.email,
           subject: `Reminder: "${meeting.title}" starts in ${minutesBefore} minutes`,
           html: `
@@ -177,10 +179,10 @@ export class ReminderScheduler {
       ? Math.max(0, Math.round((meeting.scheduledAt.getTime() - Date.now()) / 60000))
       : 0;
 
-    // Send to each participant's socket (if they're connected)
+    // Send only to the intended participant's own room (all their sockets/tabs),
+    // not a global broadcast which would leak reminders to every connected user.
     for (const participant of meeting.participants) {
-      // Emit to all sockets for this user (they might have multiple tabs)
-      this.io.emit('reminder', {
+      this.io.to(`user:${participant.userId}`).emit('reminder', {
         type: 'IN_APP',
         meetingId: meeting.id,
         meetingTitle: meeting.title,

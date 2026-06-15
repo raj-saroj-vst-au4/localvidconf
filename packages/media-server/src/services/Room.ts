@@ -15,8 +15,10 @@
 // =============================================================================
 
 import { types as mediasoupTypes } from 'mediasoup';
+import type { Server as SocketServer } from 'socket.io';
 import { Peer } from './Peer';
 import { WEBRTC_TRANSPORT_OPTIONS, MEDIA_CODECS, SIMULCAST_ENCODINGS, SCREEN_SHARE_ENCODING } from '../config/mediasoup';
+import { env } from '../config/env';
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('Room');
@@ -38,6 +40,17 @@ export class Room {
   // Peers in breakout rooms (key: breakout room ID, value: set of socket IDs)
   private breakoutPeers: Map<string, Map<string, Peer>> = new Map();
 
+  // Socket.IO server, used to broadcast media events (producer-closed,
+  // active-speaker) into the `meeting:<code>` room. Wired via setIo() after
+  // construction so the Room constructor signature stays stable.
+  private io: SocketServer | null = null;
+
+  // AudioLevelObserver on the main router. Created lazily the first time an
+  // audio producer is added (mediasoup observer creation is async, and the
+  // constructor cannot be async).
+  private audioLevelObserver: mediasoupTypes.AudioLevelObserver | null = null;
+  private audioObserverPending: Promise<mediasoupTypes.AudioLevelObserver> | null = null;
+
   constructor(
     meetingId: string,
     meetingCode: string,
@@ -47,6 +60,16 @@ export class Room {
     this.meetingCode = meetingCode;
     this.router = router;
     log.info('Room created', { meetingId, meetingCode });
+  }
+
+  /**
+   * Provide the Socket.IO server so the Room can broadcast media events
+   * (producer-closed, active-speaker) to its meeting room. Idempotent.
+   */
+  setIo(io: SocketServer): void {
+    if (!this.io) {
+      this.io = io;
+    }
   }
 
   // --- Router Access ---
@@ -62,6 +85,14 @@ export class Room {
   // --- Peer Management ---
 
   addPeer(peer: Peer): void {
+    // Enforce the per-room capacity limit (counts main + breakout peers).
+    // Throwing here rejects the join in the caller before any media is set up.
+    if (this.getPeerCount() >= env.MAX_PEERS_PER_ROOM) {
+      throw new Error(
+        `Room is full (max ${env.MAX_PEERS_PER_ROOM} participants)`
+      );
+    }
+
     this.peers.set(peer.socketId, peer);
     log.info('Peer joined room', {
       meetingId: this.meetingId,
@@ -72,9 +103,9 @@ export class Room {
   }
 
   removePeer(socketId: string): Peer | undefined {
-    const peer = this.peers.get(socketId);
-    if (peer) {
-      peer.close(); // Clean up all transports/producers/consumers
+    let removed = this.peers.get(socketId);
+    if (removed) {
+      removed.close(); // Clean up all transports/producers/consumers
       this.peers.delete(socketId);
       log.info('Peer left room', {
         meetingId: this.meetingId,
@@ -83,16 +114,18 @@ export class Room {
       });
     }
 
-    // Also check breakout rooms
+    // Also check breakout rooms. If the peer lived only in a breakout room,
+    // return that peer so callers can still emit leave notifications for it.
     for (const [breakoutId, breakoutPeerMap] of this.breakoutPeers) {
       const breakoutPeer = breakoutPeerMap.get(socketId);
       if (breakoutPeer) {
         breakoutPeer.close();
         breakoutPeerMap.delete(socketId);
+        if (!removed) removed = breakoutPeer;
       }
     }
 
-    return peer;
+    return removed;
   }
 
   getPeer(socketId: string): Peer | undefined {
@@ -139,8 +172,9 @@ export class Room {
     // Create the transport on the router
     const transport = await activeRouter.createWebRtcTransport(WEBRTC_TRANSPORT_OPTIONS);
 
-    // Set max incoming bitrate to prevent bandwidth abuse
-    await transport.setMaxIncomingBitrate(10000000); // 10 Mbps
+    // Set max incoming bitrate to prevent bandwidth abuse.
+    // Reuse the configured cap rather than duplicating the magic number.
+    await transport.setMaxIncomingBitrate(WEBRTC_TRANSPORT_OPTIONS.maxIncomingBitrate);
 
     // Store the transport on the peer
     if (direction === 'send') {
@@ -194,13 +228,94 @@ export class Room {
 
     peer.addProducer(producer);
 
-    // When the producer closes, notify all consumers
+    // Feed audio producers into the active-speaker observer (main room only).
+    if (kind === 'audio') {
+      this.addProducerToAudioObserver(producer).catch((err) => {
+        log.warn('Failed to add producer to audio observer', {
+          producerId: producer.id,
+          error: err?.message,
+        });
+      });
+    }
+
+    // When the producer's transport closes (ICE failure, peer crash, etc.) the
+    // producer dies too. Drop it locally AND tell remote peers so they remove
+    // the corresponding video/audio tile instead of leaving a ghost tile.
     producer.on('transportclose', () => {
       log.debug('Producer transport closed', { producerId: producer.id });
       peer.removeProducer(producer.id);
+      this.io
+        ?.to(`meeting:${this.meetingCode}`)
+        .emit('producer-closed', { producerId: producer.id, peerId: peer.socketId });
     });
 
     return producer;
+  }
+
+  // --- Active Speaker Detection ---
+
+  /**
+   * Lazily create the router's AudioLevelObserver and wire its events to
+   * 'active-speaker' broadcasts. The observer emits 'volumes' at most once per
+   * `interval` ms (throttled by mediasoup itself) and 'silence' when no one is
+   * speaking.
+   */
+  private async ensureAudioLevelObserver(): Promise<mediasoupTypes.AudioLevelObserver> {
+    if (this.audioLevelObserver) return this.audioLevelObserver;
+    if (this.audioObserverPending) return this.audioObserverPending;
+
+    this.audioObserverPending = this.router
+      .createAudioLevelObserver({
+        maxEntries: 1,
+        threshold: -70,
+        interval: 800,
+      })
+      .then((observer) => {
+        this.audioLevelObserver = observer;
+
+        // Someone is the loudest speaker.
+        observer.on('volumes', (volumes) => {
+          const top = volumes[0];
+          if (!top) return;
+          const producerId = top.producer.id;
+          const owner = this.findPeerByProducerId(producerId);
+          this.io?.to(`meeting:${this.meetingCode}`).emit('active-speaker', {
+            peerId: owner?.socketId ?? null,
+            participantId: owner?.participantId ?? null,
+            producerId,
+          });
+        });
+
+        // No one is speaking.
+        observer.on('silence', () => {
+          this.io?.to(`meeting:${this.meetingCode}`).emit('active-speaker', {
+            peerId: null,
+            participantId: null,
+            producerId: null,
+          });
+        });
+
+        return observer;
+      });
+
+    return this.audioObserverPending;
+  }
+
+  /**
+   * Add an audio producer to the active-speaker observer so its volume is
+   * tracked. Safe to call for any audio producer in the main room.
+   */
+  async addProducerToAudioObserver(producer: mediasoupTypes.Producer): Promise<void> {
+    const observer = await this.ensureAudioLevelObserver();
+    await observer.addProducer({ producerId: producer.id });
+  }
+
+  /** Find the main-room peer that owns the given producer id, if any. */
+  private findPeerByProducerId(producerId: string): Peer | undefined {
+    for (const peer of this.peers.values()) {
+      if (peer.getProducer(producerId)) return peer;
+    }
+    return undefined;
   }
 
   // --- Consumer Creation ---
@@ -279,6 +394,14 @@ export class Room {
 
   getBreakoutRouter(breakoutRoomId: string): mediasoupTypes.Router | undefined {
     return this.breakoutRouters.get(breakoutRoomId);
+  }
+
+  /**
+   * Public accessor for the active breakout room IDs. Use this instead of
+   * reaching into the private breakoutRouters map from other modules.
+   */
+  getBreakoutRoomIds(): string[] {
+    return Array.from(this.breakoutRouters.keys());
   }
 
   /**
@@ -383,6 +506,18 @@ export class Room {
     return this.breakoutPeers.get(breakoutRoomId) || new Map();
   }
 
+  /**
+   * Return the breakout room ID a peer currently belongs to, or undefined if
+   * the peer is in the main room (or not present). Useful on disconnect so we
+   * can notify the right breakout room before the peer is removed.
+   */
+  findBreakoutRoomId(socketId: string): string | undefined {
+    for (const [breakoutId, breakoutPeerMap] of this.breakoutPeers) {
+      if (breakoutPeerMap.has(socketId)) return breakoutId;
+    }
+    return undefined;
+  }
+
   // --- Room Cleanup ---
 
   /**
@@ -398,10 +533,18 @@ export class Room {
     }
     this.peers.clear();
 
-    // Close all breakout rooms
+    // Close the active-speaker observer (it lives on the main router).
+    if (this.audioLevelObserver) {
+      this.audioLevelObserver.close();
+      this.audioLevelObserver = null;
+    }
+    this.audioObserverPending = null;
+
+    // Close all breakout rooms (also closes every breakout router).
     this.closeAllBreakouts();
 
-    // Close the main router
+    // Close the main router (this implicitly closes any breakout routers that
+    // were not already closed above).
     this.router.close();
   }
 

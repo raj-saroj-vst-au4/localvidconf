@@ -5,6 +5,53 @@
 // =============================================================================
 
 import { z } from 'zod';
+import jwt from 'jsonwebtoken';
+
+// --- Captcha single-use guard ---
+// The captcha answer is embedded in a short-lived JWT. Without tracking, that
+// token can be replayed until it expires. We record each token's jti the first
+// time it is verified and reject any subsequent presentation of the same jti.
+//
+// NOTE: this Set is per-process (in-memory). It is sufficient for a single
+// server instance; a multi-instance deployment would need a shared store.
+const consumedCaptchaJtis = new Set<string>();
+
+interface CaptchaPayload {
+  type?: string;
+  answer?: number;
+  jti?: string;
+}
+
+/**
+ * Verify a captcha token against the expected answer and atomically consume it.
+ * Returns true only on the first successful verification of a given token.
+ * Pins the HS256 algorithm to prevent algorithm-confusion attacks.
+ */
+export function verifyAndConsumeCaptcha(
+  captchaToken: string,
+  expectedAnswer: number
+): boolean {
+  let decoded: CaptchaPayload;
+  try {
+    decoded = jwt.verify(captchaToken, process.env.NEXTAUTH_SECRET!, {
+      algorithms: ['HS256'],
+    }) as CaptchaPayload;
+  } catch {
+    return false;
+  }
+
+  if (decoded.type !== 'captcha' || decoded.answer !== expectedAnswer) {
+    return false;
+  }
+
+  // Require a jti and reject replays.
+  if (!decoded.jti || consumedCaptchaJtis.has(decoded.jti)) {
+    return false;
+  }
+
+  consumedCaptchaJtis.add(decoded.jti);
+  return true;
+}
 
 // --- Meeting Validation ---
 
@@ -82,7 +129,12 @@ export const chatMessageSchema = z.object({
 
 export const registerSchema = z.object({
   email: z.string().email('Invalid email').max(320),
-  password: z.string().min(8, 'Password must be at least 8 characters').max(128),
+  password: z.string()
+    .min(10, 'Password must be at least 10 characters')
+    .max(128)
+    .refine((p) => /[A-Za-z]/.test(p) && /[0-9]/.test(p), {
+      message: 'Password must contain at least one letter and one number',
+    }),
   name: z.string().min(1, 'Name is required').max(100).trim(),
   captchaToken: z.string().min(1),
   captchaAnswer: z.number().int(),
