@@ -130,6 +130,27 @@ export function useMediasoup({ socket, isConnected }: UseMediasoupProps): UseMed
   ) => {
     if (!socket) return;
 
+    // Release any media held by a PRIOR initialization before acquiring new
+    // devices. initializeMedia re-runs on socket reconnect (the join effect
+    // depends on isConnected) and on lobby-admit / breakout transitions. Without
+    // this, the previous getUserMedia tracks are abandoned still-live and keep
+    // the mic/camera hardware capturing — toggleAudio/toggleVideo only stop the
+    // CURRENT producer's track, never the orphaned ones, so the device stays in
+    // use even when "muted". (Uses refs/stable setters only; a no-op on first run.)
+    producersRef.current.forEach((p) => { try { p.close(); } catch { /* already closed */ } });
+    producersRef.current.clear();
+    consumersRef.current.forEach((c) => { try { c.close(); } catch { /* already closed */ } });
+    consumersRef.current.clear();
+    preferredLayerRef.current.clear();
+    sendTransportRef.current?.close();
+    sendTransportRef.current = null;
+    recvTransportRef.current?.close();
+    recvTransportRef.current = null;
+    localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+    setPeers(new Map());
+    setActiveSpeakerParticipantId(null);
+
     try {
       // 1. Create and load the mediasoup Device
       // The Device determines which codecs/features the browser supports
