@@ -105,9 +105,18 @@ app.get('/turn-credentials', (req, res) => {
   hmac.update(username);
   const credential = hmac.digest('base64');
 
+  // TURN_SERVER_URL may be a comma-separated list so clients on different
+  // networks each get a reachable entry — e.g. a LAN URL for same-subnet peers
+  // plus a public TCP-relay URL (turn:host:3478?transport=tcp) for users outside
+  // the LAN whose media can only reach the SFU by relaying through the edge.
+  const turnUrls = (process.env.TURN_SERVER_URL || 'turn:localhost:3478')
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean);
+
   res.json({
     urls: [
-      process.env.TURN_SERVER_URL || 'turn:localhost:3478',
+      ...turnUrls,
       // Also provide STUN for NAT detection (no auth needed)
       'stun:stun.l.google.com:19302',
     ],

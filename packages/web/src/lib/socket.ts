@@ -19,7 +19,14 @@ let socket: Socket | null = null;
  * @returns Socket.IO client instance
  */
 export function getSocket(token?: string): Socket {
-  if (socket?.connected) return socket;
+  // Return the existing instance whether it is connected OR still connecting.
+  // Guarding on `socket?.connected` alone is a bug: when several hooks call
+  // getSocket() during the same render — before the first connection finishes —
+  // the guard is false and a SECOND socket gets created, overwriting this
+  // singleton. The app then runs two connections; whichever hook holds the
+  // orphan socket (e.g. ChatPanel) never ran join-meeting, so its events are
+  // silently dropped server-side (meetingId unset). One socket, always.
+  if (socket) return socket;
 
   // Connect to same origin; nginx routes /media/socket.io/ to media-server:4000
   socket = io('', {

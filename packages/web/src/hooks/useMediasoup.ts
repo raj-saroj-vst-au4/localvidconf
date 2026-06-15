@@ -462,17 +462,49 @@ export function useMediasoup({ socket, isConnected }: UseMediasoupProps): UseMed
     }
   }, [socket]);
 
-  const toggleVideo = useCallback(() => {
+  const toggleVideo = useCallback(async () => {
     const producer = producersRef.current.get('video');
     if (!producer || !socket) return;
 
     if (producer.paused) {
-      producer.resume();
-      socket.emit('resume-producer', { producerId: producer.id });
-      setIsVideoEnabled(true);
+      // RE-ENABLE: the camera track was stopped on disable to free the device,
+      // so re-acquire a fresh one and swap it into the existing producer.
+      try {
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30, max: 30 },
+          },
+        });
+        const newTrack = newStream.getVideoTracks()[0];
+        await producer.replaceTrack({ track: newTrack });
+        producer.resume();
+        socket.emit('resume-producer', { producerId: producer.id });
+        // Refresh the local preview with the new track.
+        setLocalStream((prev) => {
+          const audio = prev ? prev.getAudioTracks() : [];
+          return new MediaStream([...audio, newTrack]);
+        });
+        setIsVideoEnabled(true);
+      } catch (err) {
+        console.error('Failed to re-enable camera:', err);
+      }
     } else {
+      // DISABLE: pause the producer AND stop the camera track, so the hardware
+      // (and its in-use indicator) is actually released. Pausing alone keeps the
+      // capture device open. The track is re-acquired on the next enable.
       producer.pause();
       socket.emit('pause-producer', { producerId: producer.id });
+      producer.track?.stop();
+      setLocalStream((prev) => {
+        if (!prev) return prev;
+        prev.getVideoTracks().forEach((t) => {
+          t.stop();
+          prev.removeTrack(t);
+        });
+        return new MediaStream(prev.getAudioTracks());
+      });
       setIsVideoEnabled(false);
     }
   }, [socket]);

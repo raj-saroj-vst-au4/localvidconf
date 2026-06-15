@@ -1,0 +1,21 @@
+# Keep the Docker build context small & fast. The Dockerfiles run a fresh
+# `npm install` and `next build`/`tsc` inside the image, so none of these are
+# needed in the build context (they previously bloated it to 500+ MB).
+**/node_modules
+**/.next
+**/dist
+.git
+.gitignore
+**/*.log
+**/.DS_Store
+
+# Never ship secrets or local env into an image layer
+.env
+.env.*
+deploy/.env.*
+
+# Docs / local DB data / editor cruft
+docs
+mysql_data
+**/*.swp
+**/*.swo

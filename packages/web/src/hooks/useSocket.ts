@@ -55,8 +55,13 @@ export function useSocket(): UseSocketReturn {
     });
 
     // Connect the socket
+    // Connect the socket, or — if a prior hook/page already connected this
+    // shared singleton — sync our local state now, since the one-shot 'connect'
+    // event already fired and won't fire again for this newly-added listener.
     if (!socket.connected) {
       socket.connect();
+    } else {
+      setIsConnected(true);
     }
 
     // Cleanup on unmount: disconnect and remove listeners
